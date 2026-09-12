@@ -1142,8 +1142,7 @@ function buildOverlay() {
 		'</div>' +
 		'<p class="shot-hint" role="status"></p>' +
 		'<div class="controls">' +
-		'<button type="button" class="shot-take">Capture</button>' +
-		'<button type="button" class="shot-pick">Choose photo</button>' +
+		'<button type="button" class="shot-pick" hidden>Choose photo</button>' +
 		'<button type="button" class="shot-close">Cancel</button>' +
 		'</div>';
 	document.body.appendChild(root);
@@ -1171,7 +1170,6 @@ function initPhoto() {
 	const stage = overlay.querySelector(".shot-stage");
 	const video = overlay.querySelector(".shot-video");
 	const hint = overlay.querySelector(".shot-hint");
-	const take = overlay.querySelector(".shot-take");
 	const pick = overlay.querySelector(".shot-pick");
 	const close = overlay.querySelector(".shot-close");
 
@@ -1247,7 +1245,7 @@ function initPhoto() {
 	/* Without a live picture the empty viewfinder is only in the way. */
 	function noCamera(text) {
 		stage.hidden = true;
-		take.hidden = true;
+		pick.hidden = false;
 		hint.textContent = text;
 	}
 
@@ -1256,7 +1254,7 @@ function initPhoto() {
 		recent.length = 0;
 		hint.textContent = "Point the camera at the puzzle";
 		stage.hidden = false;
-		take.hidden = false;
+		pick.hidden = true;
 		if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
 			noCamera("No camera here. Choose a photo instead.");
 			return;
@@ -1281,16 +1279,6 @@ function initPhoto() {
 	});
 	close.addEventListener("click", stop);
 	pick.addEventListener("click", function () { file.click(); });
-
-	take.addEventListener("click", function () {
-		if (stream === null || video.videoWidth === 0) return;
-		const result = readPuzzle(pixelsOf(video, video.videoWidth, video.videoHeight, STILL_SIDE));
-		if (result.ok) {
-			accept(result, "from the camera");
-		} else {
-			hint.textContent = capitalise(result.reason) + ". Try again.";
-		}
-	});
 
 	file.addEventListener("change", async function () {
 		if (file.files.length === 0) return;
