@@ -626,7 +626,17 @@ function initUI() {
 		setStatus(`Solved in ${number.format(elapsed)} ms.`, false);
 	}
 
+	/* The bin carries no label, so a first press on a filled board only warns. */
+	let clearAsked = 0;
+
 	function handleClear() {
+		const now = Date.now();
+		if (now - clearAsked > 4000 && givens(readGrid()) > 0) {
+			clearAsked = now;
+			setStatus("Press the bin again to clear the board.", false);
+			return;
+		}
+		clearAsked = 0;
 		given.fill(0);
 		showGrid(emptyGrid(), false);
 		setStatus("Enter digits, then solve.", false);
