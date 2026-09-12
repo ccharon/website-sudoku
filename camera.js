@@ -223,6 +223,120 @@ function rectify(gray, w, h, quad, size) {
 	return out;
 }
 
+/** Centres of the runs of pixels that carry a line across the whole image. */
+function lineBands(ink, size, along) {
+	const bands = [];
+	let start = -1;
+	for (let i = 0; i < size; i++) {
+		let count = 0;
+		for (let k = 0; k < size; k++) {
+			count += along ? ink[k * size + i] : ink[i * size + k];
+		}
+		const isLine = count >= size * 0.6;
+		if (isLine && start < 0) start = i;
+		if (!isLine && start >= 0) {
+			if (i - start <= size * 0.04) bands.push((start + i - 1) / 2);
+			start = -1;
+		}
+	}
+	if (start >= 0 && size - start <= size * 0.04) bands.push((start + size - 1) / 2);
+	return bands;
+}
+
+/**
+ * Length and position of the longest unbroken stretch of the line through this
+ * band. Plain first and last ink would catch every crossing line instead.
+ */
+function bandExtent(ink, size, centre, along) {
+	const from = Math.max(0, Math.round(centre) - 1);
+	const to = Math.min(size - 1, Math.round(centre) + 1);
+	let bestFirst = -1;
+	let bestLast = -1;
+	let best = -1;
+	let first = -1;
+	let last = -1;
+	let gap = 0;
+
+	function close() {
+		if (first >= 0 && last - first > best) {
+			best = last - first;
+			bestFirst = first;
+			bestLast = last;
+		}
+		first = -1;
+	}
+
+	for (let k = 0; k < size; k++) {
+		let hit = 0;
+		for (let i = from; i <= to; i++) {
+			hit |= along ? ink[k * size + i] : ink[i * size + k];
+		}
+		if (hit) {
+			if (first < 0) first = k;
+			last = k;
+			gap = 0;
+		} else if (first >= 0 && ++gap > 3) {
+			close();
+		}
+	}
+	close();
+	return [bestFirst, bestLast];
+}
+
+function median(values) {
+	const sorted = values.slice().sort(function (a, b) { return a - b; });
+	return sorted[sorted.length >> 1];
+}
+
+/**
+ * Narrows the straightened image down to the 9x9 grid. Printed puzzles often
+ * carry a title box that shares its bottom edge with the grid, so the outline
+ * of the largest patch encloses ten rows. The inner lines betray the real
+ * extent, because they stop at the grid.
+ */
+function gridBounds(ink, size) {
+	const box = { x0: 0, y0: 0, x1: size, y1: size };
+	for (const along of [true, false]) {
+		const bands = lineBands(ink, size, along);
+		if (bands.length < 4) return null;
+		const firsts = [];
+		const lasts = [];
+		for (const centre of bands.slice(1, -1)) {
+			const span = bandExtent(ink, size, centre, along);
+			if (span[0] < 0) continue;
+			firsts.push(span[0]);
+			lasts.push(span[1]);
+		}
+		if (firsts.length === 0) return null;
+		if (along) {
+			box.y0 = median(firsts);
+			box.y1 = median(lasts) + 1;
+		} else {
+			box.x0 = median(firsts);
+			box.x1 = median(lasts) + 1;
+		}
+	}
+	const trimmed = box.x0 > size * 0.02 || box.y0 > size * 0.02 ||
+		box.x1 < size * 0.98 || box.y1 < size * 0.98;
+	if (!trimmed) return null;
+	if (box.x1 - box.x0 < size * 0.5 || box.y1 - box.y0 < size * 0.5) return null;
+	return box;
+}
+
+/** Resamples a rectangle of the straightened image back to a full square. */
+function cropSquare(flat, size, box, out) {
+	const bw = box.x1 - box.x0;
+	const bh = box.y1 - box.y0;
+	const result = new Uint8ClampedArray(out * out);
+	for (let j = 0; j < out; j++) {
+		const sy = box.y0 + (j + 0.5) * bh / out;
+		for (let i = 0; i < out; i++) {
+			result[j * out + i] = sample(flat, size, size, box.x0 + (i + 0.5) * bw / out, sy);
+		}
+	}
+	return result;
+}
+
 /* ------------------------------------------------------------------ Cells */
 
 /**
@@ -538,8 +652,15 @@ function readImage(image, cellPx) {
 
 	const cell = cellPx || WARP_STILL;
 	const size = cell * 9;
-	const flat = rectify(gray, w, h, quad, size);
-	const flatInk = threshold(flat, size, size, Math.round(cell / 2), 0.9);
+	const radius = Math.round(cell / 2);
+	let flat = rectify(gray, w, h, quad, size);
+	let flatInk = threshold(flat, size, size, radius, 0.9);
+
+	const bounds = gridBounds(flatInk, size);
+	if (bounds !== null) {
+		flat = cropSquare(flat, size, bounds, size);
+		flatInk = threshold(flat, size, size, radius, 0.9);
+	}
 	const cells = cutCells(flatInk, size);
 
 	const grid = S.emptyGrid();
