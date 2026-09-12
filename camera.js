@@ -23,7 +23,8 @@ const S = globalThis.Sudoku;
 /* ------------------------------------------------------------- Image and ink */
 
 const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
-const INK_THIN = 0.78;      // stricter pass, used only for counting counters
+const INK_FIND = 0.88;      // threshold of the pass that looks for the outline
+const THIN_DROP = 0.12;     // the stricter pass, used for counters, sits this far below
 const THIN_KEEP = 0.6;      // ink the stricter pass must retain to be believed
 const INK_TRIES = [0.9, 0.96, 0.84];    // retried in this order until the reading solves
 
@@ -75,6 +76,31 @@ function threshold(gray, w, h, radius, bias) {
 	return mask;
 }
 
+/** An empty bounding box, to be grown pixel by pixel. */
+function newBox() {
+	return { x0: Infinity, y0: Infinity, x1: -1, y1: -1 };
+}
+
+function growBox(box, x, y) {
+	if (x < box.x0) box.x0 = x;
+	if (x > box.x1) box.x1 = x;
+	if (y < box.y0) box.y0 = y;
+	if (y > box.y1) box.y1 = y;
+}
+
+function boxWidth(box) { return box.x1 - box.x0 + 1; }
+
+function boxHeight(box) { return box.y1 - box.y0 + 1; }
+
+/** Copies a rectangle out of a mask into a plane of its own. */
+function copyRect(mask, stride, x0, y0, w, h) {
+	const out = new Uint8Array(w * h);
+	for (let y = 0; y < h; y++) {
+		for (let x = 0; x < w; x++) out[y * w + x] = mask[(y0 + y) * stride + x0 + x];
+	}
+	return out;
+}
+
 /**
  * Labels the connected patches of ink, eight-connected. Returns one entry per
  * label with its pixel count and bounding box.
@@ -85,7 +111,9 @@ function components(mask, w, h) {
 	const boxes = [];
 	for (let start = 0; start < w * h; start++) {
 		if (mask[start] === 0 || labels[start] >= 0) continue;
-		const box = { id: boxes.length, count: 0, x0: w, y0: h, x1: -1, y1: -1 };
+		const box = newBox();
+		box.id = boxes.length;
+		box.count = 0;
 		let top = 0;
 		stack[top++] = start;
 		labels[start] = box.id;
@@ -94,10 +122,7 @@ function components(mask, w, h) {
 			const x = p % w;
 			const y = (p - x) / w;
 			box.count++;
-			if (x < box.x0) box.x0 = x;
-			if (x > box.x1) box.x1 = x;
-			if (y < box.y0) box.y0 = y;
-			if (y > box.y1) box.y1 = y;
+			growBox(box, x, y);
 			for (let dy = -1; dy <= 1; dy++) {
 				const ny = y + dy;
 				if (ny < 0 || ny >= h) continue;
@@ -252,28 +277,28 @@ function orderQuad(quad) {
 	return [ring[first], ring[(first + 1) % 4], ring[(first + 2) % 4], ring[(first + 3) % 4]];
 }
 
-/** Rejects quadrilaterals too lopsided to be a photographed grid. */
-function plausibleQuad(quad) {
-	let shortest = Infinity;
-	let longest = 0;
+/** The four side lengths of a quadrilateral, from corner i to corner i + 1. */
+function sideLengths(quad) {
+	const out = [];
 	for (let i = 0; i < 4; i++) {
 		const a = quad[i];
 		const b = quad[(i + 1) % 4];
-		const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
-		if (len < shortest) shortest = len;
-		if (len > longest) longest = len;
+		out.push(Math.hypot(b[0] - a[0], b[1] - a[1]));
 	}
-	return shortest > 8 && longest / shortest < 2.5;
+	return out;
+}
+
+/** Rejects quadrilaterals too lopsided to be a photographed grid. */
+function plausibleQuad(quad) {
+	const sides = sideLengths(quad);
+	const shortest = Math.min(...sides);
+	return shortest > 8 && Math.max(...sides) / shortest < 2.5;
 }
 
 /** Mean side length of the quadrilateral, in pixels of the photo. */
 function sideOf(quad) {
 	let sum = 0;
-	for (let i = 0; i < 4; i++) {
-		const a = quad[i];
-		const b = quad[(i + 1) % 4];
-		sum += Math.hypot(b[0] - a[0], b[1] - a[1]);
-	}
+	for (const len of sideLengths(quad)) sum += len;
 	return sum / 4;
 }
 
@@ -327,30 +352,30 @@ function rectify(gray, w, h, quad, size) {
 	return out;
 }
 
-/** Resamples a rectangle of the straightened image back to a full square. */
-function cropSquare(flat, size, box, out) {
-	const bw = box.x1 - box.x0;
-	const bh = box.y1 - box.y0;
-	const result = new Uint8ClampedArray(out * out);
-	for (let j = 0; j < out; j++) {
-		const sy = box.y0 + (j + 0.5) * bh / out;
-		for (let i = 0; i < out; i++) {
-			result[j * out + i] = sample(flat, size, size, box.x0 + (i + 0.5) * bw / out, sy);
-		}
-	}
-	return result;
+/** The corners of an axis aligned rectangle, in the order rectify expects. */
+function rectQuad(rect) {
+	return [[rect.x0, rect.y0], [rect.x1, rect.y0], [rect.x1, rect.y1], [rect.x0, rect.y1]];
 }
 
 /* ---------------------------------------------------------------- Grid lines */
 
+/**
+ * Index steps of one direction: from one band to the next, and from one pixel
+ * of a line to the next along it. With along set the bands are columns.
+ */
+function lineSteps(size, along) {
+	return along ? { band: 1, walk: size } : { band: size, walk: 1 };
+}
+
 /** Centres of the runs of pixels that carry a line across the whole image. */
 function lineBands(ink, size, along) {
+	const { band, walk } = lineSteps(size, along);
 	const bands = [];
 	let start = -1;
 	for (let i = 0; i < size; i++) {
 		let count = 0;
 		for (let k = 0; k < size; k++) {
-			count += along ? ink[k * size + i] : ink[i * size + k];
+			count += ink[i * band + k * walk];
 		}
 		const isLine = count >= size * 0.6;
 		if (isLine && start < 0) start = i;
@@ -368,6 +393,7 @@ function lineBands(ink, size, along) {
  * band. Plain first and last ink would catch every crossing line instead.
  */
 function bandExtent(ink, size, centre, along) {
+	const { band, walk } = lineSteps(size, along);
 	const from = Math.max(0, Math.round(centre) - 1);
 	const to = Math.min(size - 1, Math.round(centre) + 1);
 	let bestFirst = -1;
@@ -389,7 +415,7 @@ function bandExtent(ink, size, centre, along) {
 	for (let k = 0; k < size; k++) {
 		let hit = 0;
 		for (let i = from; i <= to; i++) {
-			hit |= along ? ink[k * size + i] : ink[i * size + k];
+			hit |= ink[i * band + k * walk];
 		}
 		if (hit) {
 			if (first < 0) first = k;
@@ -424,8 +450,8 @@ function innerExtent(ink, size, bands, along) {
  */
 function bandScore(ink, size) {
 	let score = 1;
-	for (let dir = 0; dir < 2; dir++) {
-		const bands = lineBands(ink, size, dir === 0);
+	for (const along of [true, false]) {
+		const bands = lineBands(ink, size, along);
 		if (bands.length < 8) return 0;
 		const steps = [];
 		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
@@ -477,13 +503,7 @@ const SCORE_CELL = 24;      // cell size of the cheap pass that rates a candidat
 function refineQuad(quad, points) {
 	let current = quad;
 	for (let pass = 0; pass < 2; pass++) {
-		let span = 0;
-		for (let i = 0; i < 4; i++) {
-			const a = current[i];
-			const b = current[(i + 1) % 4];
-			span += Math.hypot(b[0] - a[0], b[1] - a[1]);
-		}
-		const near = span / 4 * 0.06;
+		const near = sideOf(current) * 0.06;
 		const sides = [[], [], [], []];
 		for (const p of points) {
 			let at = -1;
@@ -510,9 +530,8 @@ function refineQuad(quad, points) {
 	return current;
 }
 
-/** The four corners of one ink patch, or null if it has too few pixels. */
-function quadOf(labels, w, box) {
-	// Only the outermost pixel of each row and column can lie on a side.
+/** The outermost pixel of each row and column, the only ones that lie on a side. */
+function outlinePoints(labels, w, box) {
 	const points = [];
 	for (let y = box.y0; y <= box.y1; y++) {
 		let from = -1;
@@ -540,6 +559,12 @@ function quadOf(labels, w, box) {
 			if (to !== from) points.push([x, to]);
 		}
 	}
+	return points;
+}
+
+/** The four corners of one ink patch, or null if it has too few pixels. */
+function quadOf(labels, w, box) {
+	const points = outlinePoints(labels, w, box);
 	if (points.length < 8) return null;
 
 	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
@@ -564,8 +589,8 @@ function findGrid(gray, ink, w, h) {
 	const minArea = w * h * 0.02;
 	const candidates = [];
 	for (const box of found.boxes) {
-		const bw = box.x1 - box.x0 + 1;
-		const bh = box.y1 - box.y0 + 1;
+		const bw = boxWidth(box);
+		const bh = boxHeight(box);
 		const area = bw * bh;
 		if (area < minArea) continue;
 		if (bw / bh < 0.5 || bw / bh > 2) continue;
@@ -598,8 +623,8 @@ const NORM_FIT = 24;        // the digit is scaled to fit this box
  * font size and position inside the cell stop mattering.
  */
 function normalise(bitmap, w, box) {
-	const bw = box.x1 - box.x0 + 1;
-	const bh = box.y1 - box.y0 + 1;
+	const bw = boxWidth(box);
+	const bh = boxHeight(box);
 	const scale = NORM_FIT / Math.max(bw, bh);
 	const tw = Math.max(1, Math.min(NORM, Math.round(bw * scale)));
 	const th = Math.max(1, Math.min(NORM, Math.round(bh * scale)));
@@ -639,25 +664,19 @@ function normalise(bitmap, w, box) {
 }
 
 /** Returns the normalised digit bitmap of one cell, or null if it is empty. */
-function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
-	const w = x1 - x0;
-	const h = y1 - y0;
-	const sub = new Uint8Array(w * h);
-	let ink = 0;
-	for (let y = 0; y < h; y++) {
-		for (let x = 0; x < w; x++) {
-			const v = mask[(y0 + y) * size + x0 + x];
-			sub[y * w + x] = v;
-			ink += v;
-		}
-	}
-	if (ink < w * h * 0.006) return null;
+function isolateDigit(ink, thin, size, rect, sourceScale) {
+	const w = rect.x1 - rect.x0;
+	const h = rect.y1 - rect.y0;
+	const sub = copyRect(ink, size, rect.x0, rect.y0, w, h);
+	let marked = 0;
+	for (let i = 0; i < sub.length; i++) marked += sub[i];
+	if (marked < w * h * 0.006) return null;
 
 	const found = components(sub, w, h);
 	let best = null;
 	for (const box of found.boxes) {
-		const bw = box.x1 - box.x0 + 1;
-		const bh = box.y1 - box.y0 + 1;
+		const bw = boxWidth(box);
+		const bh = boxHeight(box);
 		if (box.count < 5) continue;
 		if (bh < h * 0.22) continue;     // flat leftovers are grid lines
 		if (bw > w * 0.92) continue;     // a run across the cell is a line
@@ -669,15 +688,12 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 	if (best === null) return null;
 
 	// Too little of it to call a digit. Kept so the solver can still ask.
-	const faint = ink < w * h * 0.02 || best.count < 10 ||
-		(best.y1 - best.y0 + 1) < h * 0.3;
+	const faint = marked < w * h * 0.02 || best.count < 10 || boxHeight(best) < h * 0.3;
 
 	const digit = new Uint8Array(w * h);
 	for (let p = 0; p < w * h; p++) digit[p] = found.labels[p] === best.id ? 1 : 0;
 	const norm = normalise(digit, w, best);
 	if (norm === null) return null;
-	const bw = best.x1 - best.x0 + 1;
-	const bh = best.y1 - best.y0 + 1;
 
 	/*
 	 * Thick ink closes a counter, which only the stricter pass still sees. Weak
@@ -689,16 +705,16 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 	let kept = 0;
 	for (let y = best.y0; y <= best.y1; y++) {
 		for (let x = best.x0; x <= best.x1; x++) {
-			slim[y * w + x] = thin[(y0 + y) * size + x0 + x];
+			slim[y * w + x] = thin[(rect.y0 + y) * size + rect.x0 + x];
 			full += digit[y * w + x];
 			kept += slim[y * w + x];
 		}
 	}
 	const counted = kept > full * THIN_KEEP ? slim : digit;
-	const tall = bh * sourceScale;
+	const tall = boxHeight(best) * sourceScale;
 	return {
 		mask: norm,
-		holes: holeCount(counted, w, h, minHole(bw, bh)),
+		holes: holeCount(counted, w, h, minHole(best)),
 		trust: Math.min(1, tall / HOLE_SURE),
 		faint: faint
 	};
@@ -708,16 +724,18 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
  * Cuts the straightened grid into cells. The outer share of every cell is
  * dropped so the grid lines fall away.
  */
-function cutCells(mask, thin, size, sourceScale) {
+function cutCells(ink, thin, size, sourceScale) {
 	const cell = size / 9;
 	const inset = Math.round(cell * CELL_INSET);
 	const out = [];
 	for (let r = 0; r < 9; r++) {
 		for (let c = 0; c < 9; c++) {
-			out.push(isolateDigit(mask, thin, size,
-				Math.round(c * cell) + inset, Math.round(r * cell) + inset,
-				Math.round((c + 1) * cell) - inset, Math.round((r + 1) * cell) - inset,
-				sourceScale));
+			out.push(isolateDigit(ink, thin, size, {
+				x0: Math.round(c * cell) + inset,
+				y0: Math.round(r * cell) + inset,
+				x1: Math.round((c + 1) * cell) - inset,
+				y1: Math.round((r + 1) * cell) - inset
+			}, sourceScale));
 		}
 	}
 	return out;
@@ -728,43 +746,44 @@ function cutCells(mask, thin, size, sourceScale) {
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
 const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
 
+/**
+ * Carries the distance of the already visited row and neighbour into every
+ * pixel, running from one corner of the bitmap to the opposite one.
+ */
+function sweep(dist, dir) {
+	const first = dir > 0 ? 0 : NORM - 1;
+	const past = dir > 0 ? NORM : -1;
+	for (let y = first; y !== past; y += dir) {
+		const row = y - dir;
+		for (let x = first; x !== past; x += dir) {
+			const i = y * NORM + x;
+			let d = dist[i];
+			if (row >= 0 && row < NORM) {
+				const j = row * NORM + x;
+				if (dist[j] + 3 < d) d = dist[j] + 3;
+				if (x > 0 && dist[j - 1] + 4 < d) d = dist[j - 1] + 4;
+				if (x < NORM - 1 && dist[j + 1] + 4 < d) d = dist[j + 1] + 4;
+			}
+			const side = x - dir;
+			if (side >= 0 && side < NORM && dist[i - dir] + 3 < d) d = dist[i - dir] + 3;
+			dist[i] = d;
+		}
+	}
+}
+
 /** Chamfer distance to the nearest ink pixel, two passes over the bitmap. */
 function distanceMap(bitmap) {
 	const dist = new Float32Array(NORM * NORM);
 	for (let i = 0; i < dist.length; i++) dist[i] = bitmap[i] ? 0 : 1e4;
-	for (let y = 0; y < NORM; y++) {
-		for (let x = 0; x < NORM; x++) {
-			const i = y * NORM + x;
-			let d = dist[i];
-			if (y > 0) {
-				if (dist[i - NORM] + 3 < d) d = dist[i - NORM] + 3;
-				if (x > 0 && dist[i - NORM - 1] + 4 < d) d = dist[i - NORM - 1] + 4;
-				if (x < NORM - 1 && dist[i - NORM + 1] + 4 < d) d = dist[i - NORM + 1] + 4;
-			}
-			if (x > 0 && dist[i - 1] + 3 < d) d = dist[i - 1] + 3;
-			dist[i] = d;
-		}
-	}
-	for (let y = NORM - 1; y >= 0; y--) {
-		for (let x = NORM - 1; x >= 0; x--) {
-			const i = y * NORM + x;
-			let d = dist[i];
-			if (y < NORM - 1) {
-				if (dist[i + NORM] + 3 < d) d = dist[i + NORM] + 3;
-				if (x > 0 && dist[i + NORM - 1] + 4 < d) d = dist[i + NORM - 1] + 4;
-				if (x < NORM - 1 && dist[i + NORM + 1] + 4 < d) d = dist[i + NORM + 1] + 4;
-			}
-			if (x < NORM - 1 && dist[i + 1] + 3 < d) d = dist[i + 1] + 3;
-			dist[i] = d;
-		}
-	}
+	sweep(dist, 1);
+	sweep(dist, -1);
 	for (let i = 0; i < dist.length; i++) dist[i] /= 3;
 	return dist;
 }
 
 /** A counter smaller than this share of the digit is threshold noise. */
-function minHole(bw, bh) {
-	return Math.max(2, Math.round(bw * bh * 0.004));
+function minHole(box) {
+	return Math.max(2, Math.round(boxWidth(box) * boxHeight(box) * 0.004));
 }
 
 /**
@@ -860,16 +879,21 @@ const FONTS = [
 
 let templates = null;
 
+/** A canvas context of the given size, set up for reading the pixels back. */
+function drawingContext(width, height) {
+	const canvas = document.createElement("canvas");
+	canvas.width = width;
+	canvas.height = height;
+	return canvas.getContext("2d", { willReadFrequently: true });
+}
+
 /**
  * Draws the digits 1 to 9 in several fonts and normalises them like the cells.
  * The font rasteriser of the browser takes the place of a trained model.
  */
 function buildTemplates() {
 	const side = 160;
-	const canvas = document.createElement("canvas");
-	canvas.width = side;
-	canvas.height = side;
-	const ctx = canvas.getContext("2d", { willReadFrequently: true });
+	const ctx = drawingContext(side, side);
 	const out = [];
 	const seen = new Set();
 
@@ -885,15 +909,12 @@ function buildTemplates() {
 
 			const data = ctx.getImageData(0, 0, side, side).data;
 			const bitmap = new Uint8Array(side * side);
-			const box = { x0: side, y0: side, x1: -1, y1: -1 };
+			const box = newBox();
 			for (let y = 0; y < side; y++) {
 				for (let x = 0; x < side; x++) {
 					if (data[(y * side + x) * 4] >= 128) continue;
 					bitmap[y * side + x] = 1;
-					if (x < box.x0) box.x0 = x;
-					if (x > box.x1) box.x1 = x;
-					if (y < box.y0) box.y0 = y;
-					if (y > box.y1) box.y1 = y;
+					growBox(box, x, y);
 				}
 			}
 			if (box.x1 < 0) continue;
@@ -902,8 +923,7 @@ function buildTemplates() {
 			const key = digit + ":" + mask.join("");
 			if (seen.has(key)) continue;    // the same face under another name
 			seen.add(key);
-			const holes = holeCount(bitmap, side, side,
-				minHole(box.x1 - box.x0 + 1, box.y1 - box.y0 + 1));
+			const holes = holeCount(bitmap, side, side, minHole(box));
 			const shape = shapeOf(mask, holes, 1);
 			shape.digit = digit;
 			out.push(shape);
@@ -931,6 +951,11 @@ function classify(cell) {
 const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
 const WARP_STILL = 80;      // pixels per cell for a single picture
 
+/** The ink mask of a straightened grid at one threshold. */
+function inkOf(plane, bias) {
+	return threshold(plane.flat, plane.size, plane.size, plane.radius, bias);
+}
+
 /** Finds the grid and straightens it, the costly half of a reading. */
 function straighten(image, cellPx) {
 	if (templates === null) templates = buildTemplates();
@@ -938,29 +963,33 @@ function straighten(image, cellPx) {
 	const w = image.width;
 	const h = image.height;
 	const gray = toGray(image);
-	const ink = threshold(gray, w, h, Math.max(4, Math.round(Math.min(w, h) / 24)), 0.88);
+	const ink = threshold(gray, w, h, Math.max(4, Math.round(Math.min(w, h) / 24)), INK_FIND);
 
 	const quad = findGrid(gray, ink, w, h);
 	if (quad === null) return null;
 
 	const cell = cellPx || WARP_STILL;
 	const size = cell * 9;
-	const radius = Math.round(cell / 2);
-	let flat = rectify(gray, w, h, quad, size);
-	let scale = sideOf(quad) / size;
+	const plane = {
+		flat: rectify(gray, w, h, quad, size),
+		size: size,
+		radius: Math.round(cell / 2),
+		scale: sideOf(quad) / size,
+		quad: quad
+	};
 
 	// The cut is kept only if the lines come out more regular for it.
-	const before = threshold(flat, size, size, radius, INK_BIAS);
+	const before = inkOf(plane, INK_BIAS);
 	const bounds = gridBounds(before, size);
 	if (bounds !== null) {
-		const cropped = cropSquare(flat, size, bounds, size);
-		const after = threshold(cropped, size, size, radius, INK_BIAS);
+		const cropped = rectify(plane.flat, size, size, rectQuad(bounds), size);
+		const after = threshold(cropped, size, size, plane.radius, INK_BIAS);
 		if (bandScore(after, size) > bandScore(before, size) + 0.05) {
-			flat = cropped;
-			scale *= (bounds.y1 - bounds.y0) / size;
+			plane.flat = cropped;
+			plane.scale *= (bounds.y1 - bounds.y0) / size;
 		}
 	}
-	return { flat: flat, size: size, radius: radius, scale: scale, quad: quad };
+	return plane;
 }
 
 /**
@@ -968,9 +997,8 @@ function straighten(image, cellPx) {
  * the grid, the ranking per cell and how clearly each cell was decided.
  */
 function readCells(plane, bias) {
-	const ink = threshold(plane.flat, plane.size, plane.size, plane.radius, bias);
-	const thin = threshold(plane.flat, plane.size, plane.size, plane.radius,
-		bias - (INK_BIAS - INK_THIN));
+	const ink = inkOf(plane, bias);
+	const thin = inkOf(plane, bias - THIN_DROP);
 	const cells = cutCells(ink, thin, plane.size, plane.scale);
 
 	const grid = S.emptyGrid();
@@ -1002,6 +1030,8 @@ function readImage(image, cellPx, bias) {
 
 const FAINT_COST = 0.15;    // what it costs to read a digit into a nearly empty cell
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
+const SINGLE_TRIES = 16;    // doubtful cells offered to the search, one at a time
+const PAIR_TRIES = 10;      // and to the search over two of them
 
 function unique(grid) {
 	if (S.validate(grid).length > 0) return false;
@@ -1056,6 +1086,37 @@ function swap(grid, cells, choice) {
 }
 
 /**
+ * The cheapest way to make the grid unique by changing exactly depth of the
+ * offered cells, each to one of the other values it would accept.
+ */
+function bestSwap(grid, cells, depth) {
+	const chosen = [];
+	const choice = [];
+	let found = null;
+
+	function walk(from) {
+		if (chosen.length === depth) {
+			const candidate = swap(grid, chosen, choice);
+			if (!unique(candidate.grid)) return;
+			if (found === null || candidate.cost < found.cost) found = candidate;
+			return;
+		}
+		for (let i = from; i < cells.length; i++) {
+			chosen.push(cells[i]);
+			for (let k = 1; k < cells[i].options.length; k++) {
+				choice.push(k);
+				walk(i + 1);
+				choice.pop();
+			}
+			chosen.pop();
+		}
+	}
+
+	walk(0);
+	return found;
+}
+
+/**
  * A correct reading has exactly one solution. If it has none or several, the
  * least certain cells are changed until it has.
  */
@@ -1063,30 +1124,9 @@ function repair(reading) {
 	if (unique(reading.grid)) return { grid: reading.grid, changed: [] };
 
 	const doubtful = doubtfulCells(reading);
-	let found = null;
-
-	for (const cell of doubtful.slice(0, 16)) {
-		for (let k = 1; k < cell.options.length; k++) {
-			const candidate = swap(reading.grid, [cell], [k]);
-			if (!unique(candidate.grid)) continue;
-			if (found === null || candidate.cost < found.cost) found = candidate;
-		}
-	}
-	if (found !== null) return found;
-
-	const pairs = doubtful.slice(0, 10);
-	for (let a = 0; a < pairs.length; a++) {
-		for (let b = a + 1; b < pairs.length; b++) {
-			for (let ka = 1; ka < pairs[a].options.length; ka++) {
-				for (let kb = 1; kb < pairs[b].options.length; kb++) {
-					const candidate = swap(reading.grid, [pairs[a], pairs[b]], [ka, kb]);
-					if (!unique(candidate.grid)) continue;
-					if (found === null || candidate.cost < found.cost) found = candidate;
-				}
-			}
-		}
-	}
-	return found;
+	const single = bestSwap(reading.grid, doubtful.slice(0, SINGLE_TRIES), 1);
+	if (single !== null) return single;
+	return bestSwap(reading.grid, doubtful.slice(0, PAIR_TRIES), 2);
 }
 
 /** Marks the cells the user should look at before solving. */
@@ -1137,10 +1177,7 @@ function pixelsOf(source, width, height, maxSide) {
 	const scale = Math.min(1, maxSide / Math.max(width, height));
 	const w = Math.max(1, Math.round(width * scale));
 	const h = Math.max(1, Math.round(height * scale));
-	const canvas = document.createElement("canvas");
-	canvas.width = w;
-	canvas.height = h;
-	const ctx = canvas.getContext("2d", { willReadFrequently: true });
+	const ctx = drawingContext(w, h);
 	ctx.drawImage(source, 0, 0, w, h);
 	return ctx.getImageData(0, 0, w, h);
 }
@@ -1177,6 +1214,10 @@ function buildOverlay() {
 		'</div>';
 	document.body.appendChild(root);
 	return root;
+}
+
+function capitalise(text) {
+	return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /* Writes to the status line even when app.js has not published its hook. */
@@ -1326,10 +1367,6 @@ function initPhoto() {
 		}
 		file.value = "";
 	});
-}
-
-function capitalise(text) {
-	return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 S.camera = { readImage: readImage, readPuzzle: readPuzzle, repair: repair };
