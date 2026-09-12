@@ -21,6 +21,9 @@ const STILL_SIDE = 1600;    // a picked photo is scaled to this
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
 const AGREE_FRAMES = 3;     // live frames that must agree before accepting
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
+const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
+const INK_THIN = 0.78;      // stricter pass, used only for counting counters
+const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
 
 /* ------------------------------------------------------------- Grey and ink */
 
@@ -155,6 +158,17 @@ function findGrid(mask, w, h) {
 	}
 	const quad = [tl, tr, br, bl];
 	return plausibleQuad(quad) ? quad : null;
+}
+
+/** Mean side length of the quadrilateral, in pixels of the photo. */
+function sideOf(quad) {
+	let sum = 0;
+	for (let i = 0; i < 4; i++) {
+		const a = quad[i];
+		const b = quad[(i + 1) % 4];
+		sum += Math.hypot(b[0] - a[0], b[1] - a[1]);
+	}
+	return sum / 4;
 }
 
 /** Rejects quadrilaterals too lopsided to be a photographed grid. */
@@ -385,7 +399,7 @@ function normalise(bitmap, w, box) {
 }
 
 /** Returns the normalised digit bitmap of one cell, or null if it is empty. */
-function isolateDigit(mask, size, x0, y0, x1, y1) {
+function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 	const w = x1 - x0;
 	const h = y1 - y0;
 	const sub = new Uint8Array(w * h);
@@ -417,22 +431,36 @@ function isolateDigit(mask, size, x0, y0, x1, y1) {
 	if (norm === null) return null;
 	const bw = best.x1 - best.x0 + 1;
 	const bh = best.y1 - best.y0 + 1;
-	return { mask: norm, holes: holeCount(digit, w, h, minHole(bw, bh)) };
+
+	// Counters are counted on the thinner pass, where a narrow opening survives.
+	const slim = new Uint8Array(w * h);
+	for (let y = best.y0; y <= best.y1; y++) {
+		for (let x = best.x0; x <= best.x1; x++) {
+			slim[y * w + x] = thin[(y0 + y) * size + x0 + x];
+		}
+	}
+	const tall = bh * sourceScale;
+	return {
+		mask: norm,
+		holes: holeCount(slim, w, h, minHole(bw, bh)),
+		trust: Math.min(1, tall / HOLE_SURE)
+	};
 }
 
 /**
  * Cuts the straightened grid into cells. The outer share of every cell is
  * dropped so the grid lines fall away.
  */
-function cutCells(mask, size) {
+function cutCells(mask, thin, size, sourceScale) {
 	const cell = size / 9;
 	const inset = Math.round(cell * CELL_INSET);
 	const out = [];
 	for (let r = 0; r < 9; r++) {
 		for (let c = 0; c < 9; c++) {
-			out.push(isolateDigit(mask, size,
+			out.push(isolateDigit(mask, thin, size,
 				Math.round(c * cell) + inset, Math.round(r * cell) + inset,
-				Math.round((c + 1) * cell) - inset, Math.round((r + 1) * cell) - inset));
+				Math.round((c + 1) * cell) - inset, Math.round((r + 1) * cell) - inset,
+				sourceScale));
 		}
 	}
 	return out;
@@ -526,13 +554,18 @@ function holeCount(bitmap, w, h, limit) {
 	return holes;
 }
 
-function shapeOf(mask, holes) {
-	return { mask: mask, dist: distanceMap(mask), holes: holes };
+function shapeOf(mask, holes, trust) {
+	return { mask: mask, dist: distanceMap(mask), holes: holes, trust: trust };
 }
 
-/** Distance plus the difference in enclosed areas. Lower fits better. */
-function shapeDistance(a, b) {
-	return chamfer(a, b) + HOLE_COST * Math.abs(a.holes - b.holes);
+/**
+ * Distance plus the difference in enclosed areas, weighted by how well the
+ * cell resolves them. A digit twelve pixels tall closes its own counters, so
+ * counting them there would decide against the right digit.
+ */
+function shapeDistance(cell, template) {
+	return chamfer(cell, template) +
+		HOLE_COST * cell.trust * Math.abs(cell.holes - template.holes);
 }
 
 /** Symmetric mean distance between two digit bitmaps. */
@@ -611,7 +644,7 @@ function buildTemplates() {
 			seen.add(key);
 			const holes = holeCount(bitmap, side, side,
 				minHole(box.x1 - box.x0 + 1, box.y1 - box.y0 + 1));
-			const shape = shapeOf(mask, holes);
+			const shape = shapeOf(mask, holes, 1);
 			shape.digit = digit;
 			out.push(shape);
 		}
@@ -621,7 +654,7 @@ function buildTemplates() {
 
 /** Ranks the digits 1 to 9 for one isolated cell. */
 function classify(cell) {
-	const shape = shapeOf(cell.mask, cell.holes);
+	const shape = shapeOf(cell.mask, cell.holes, cell.trust);
 	const best = new Float64Array(10).fill(Infinity);
 	for (const template of templates) {
 		const score = shapeDistance(shape, template);
@@ -654,14 +687,16 @@ function readImage(image, cellPx) {
 	const size = cell * 9;
 	const radius = Math.round(cell / 2);
 	let flat = rectify(gray, w, h, quad, size);
-	let flatInk = threshold(flat, size, size, radius, 0.9);
+	let flatInk = threshold(flat, size, size, radius, INK_BIAS);
 
+	let sourceScale = sideOf(quad) / size;
 	const bounds = gridBounds(flatInk, size);
 	if (bounds !== null) {
 		flat = cropSquare(flat, size, bounds, size);
-		flatInk = threshold(flat, size, size, radius, 0.9);
+		flatInk = threshold(flat, size, size, radius, INK_BIAS);
+		sourceScale *= (bounds.y1 - bounds.y0) / size;
 	}
-	const cells = cutCells(flatInk, size);
+	const cells = cutCells(flatInk, threshold(flat, size, size, radius, INK_THIN), size, sourceScale);
 
 	const grid = S.emptyGrid();
 	const margin = new Float64Array(S.CELLS);
