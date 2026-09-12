@@ -668,10 +668,22 @@ function buildOverlay() {
 	return root;
 }
 
+/* Writes to the status line even when app.js has not published its hook. */
+function say(text, isError) {
+	if (S.ui) {
+		S.ui.setStatus(text, isError);
+		return;
+	}
+	const status = document.getElementById("status");
+	if (status !== null) {
+		status.textContent = text;
+		status.classList.toggle("error", Boolean(isError));
+	}
+}
+
 function initPhoto() {
-	const ui = S.ui;
 	const button = document.getElementById("photo");
-	if (!ui || button === null) return;
+	if (button === null) return;
 
 	const overlay = buildOverlay();
 	const stage = overlay.querySelector(".shot-stage");
@@ -705,11 +717,15 @@ function initPhoto() {
 
 	function accept(result, note) {
 		stop();
-		ui.setPuzzle(result.grid, result.uncertain);
+		if (!S.ui) {
+			say("The board is not ready. Reload the page.", true);
+			return;
+		}
+		S.ui.setPuzzle(result.grid, result.uncertain);
 		const open = result.uncertain.reduce(function (n, v) { return n + v; }, 0);
 		const checked = open === 0 ? "" :
 			` Check the ${open} marked cell${open === 1 ? "" : "s"}.`;
-		ui.setStatus(`${S.givens(result.grid)} givens read ${note}.${checked}`, false);
+		say(`${S.givens(result.grid)} givens read ${note}.${checked}`, false);
 	}
 
 	function tick() {
@@ -766,7 +782,12 @@ function initPhoto() {
 		}
 	}
 
-	button.addEventListener("click", open);
+	button.addEventListener("click", function () {
+		open().catch(function (error) {
+			overlay.hidden = false;
+			hint.textContent = "Could not open the camera: " + error.message;
+		});
+	});
 	close.addEventListener("click", stop);
 	pick.addEventListener("click", function () { file.click(); });
 

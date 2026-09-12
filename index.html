@@ -26,14 +26,40 @@
 		<p id="status" class="status" role="status">Enter digits, then solve.</p>
 		<div id="board" class="board"></div>
 		<div class="controls">
-			<button type="button" id="generate">New puzzle</button>
-			<button type="button" id="check">Check</button>
-			<button type="button" id="solve">Solve</button>
-			<button type="button" id="clear">Clear</button>
+			<button type="button" id="generate">
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+					<rect x="4" y="4" width="16" height="16" rx="3"/>
+					<circle class="dot" cx="8.8" cy="8.8" r="1.7"/>
+					<circle class="dot" cx="12" cy="12" r="1.7"/>
+					<circle class="dot" cx="15.2" cy="15.2" r="1.7"/>
+				</svg>
+				New puzzle
+			</button>
+			<button type="button" id="check">
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+					<path d="M4.5 12.5 10 18 19.5 6.5"/>
+				</svg>
+				Check
+			</button>
+			<button type="button" id="solve">
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+					<path d="M8.2 14.2a5.8 5.8 0 1 1 7.6 0c-.8.7-1.3 1.5-1.3 2.3H9.5c0-.8-.5-1.6-1.3-2.3Z"/>
+					<path d="M9.9 19.1H14.1"/>
+					<path d="M10.8 21.5H13.2"/>
+				</svg>
+				Solve
+			</button>
+			<button type="button" id="clear">
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+					<path d="M4.5 6.75H19.5"/>
+					<path d="M9.75 6.75V4.5H14.25V6.75"/>
+					<path d="M6.75 6.75 7.75 20.25H16.25L17.25 6.75"/>
+				</svg>
+				Clear
+			</button>
 			<button type="button" id="photo" class="icon-button"
 				aria-label="Read a puzzle from a photo" title="Read a puzzle from a photo">
-				<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
-					stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
+				<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
 					<path d="M2.75 7.75H6.75L8.25 5.25H15.75L17.25 7.75H21.25V19.25H2.75Z"/>
 					<circle cx="12" cy="13.5" r="3.6"/>
 				</svg>

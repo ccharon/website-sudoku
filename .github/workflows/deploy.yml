@@ -27,6 +27,7 @@ jobs:
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
           SHA=$(git rev-parse --short HEAD)
+          sed -i -E "s/(href|src)=\"(app\.js|camera\.js|style\.css)\"/\\1=\"\\2?v=$SHA\"/g" index.html
           git checkout --orphan dist-new
           git rm -rf . --cached
           git add index.html style.css app.js camera.js icons/favicon.svg icons/favicon-32.png icons/apple-touch-icon.png
