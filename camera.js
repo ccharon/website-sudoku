@@ -500,7 +500,9 @@ function gridBounds(ink, size) {
 /* ------------------------------------------------------------ Grid detection */
 
 const CANDIDATES = 6;       // ink patches examined before settling on one
-const SCORE_CELL = 24;      // cell size of the cheap pass that rates a candidate
+const SCORE_CELL = 32;      // cell size of the cheap pass that rates a candidate
+const WEAK_GRID = 0.02;     // below this the patch is tried again without its attachments
+const RUN_SHARE = 0.3;      // share of the patch a run must span to pass as a line
 
 /**
  * Fits a line to each of the four sides and intersects them. A thin or blurred
@@ -569,15 +571,51 @@ function outlinePoints(labels, w, box) {
 	return points;
 }
 
-/** The four corners of one ink patch, or null if it has too few pixels. */
-function quadOf(labels, w, box) {
-	const points = outlinePoints(labels, w, box);
+/** Hull, largest quadrilateral, then the sides fitted to the points again. */
+function quadFromPoints(points) {
 	if (points.length < 8) return null;
-
 	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
 	if (corners === null) return null;
 	const quad = orderQuad(refineQuad(orderQuad(corners), points));
 	return plausibleQuad(quad) ? quad : null;
+}
+
+/** The four corners of one ink patch, or null if it has too few pixels. */
+function quadOf(labels, w, box) {
+	return quadFromPoints(outlinePoints(labels, w, box));
+}
+
+/**
+ * The outline of the patch with only the pixels that lie in a long run, so
+ * nothing but its lines is left. A drawing that touches the frame drops out,
+ * and with it the corner it would pull away.
+ */
+function latticePoints(labels, w, box) {
+	const bw = boxWidth(box);
+	const bh = boxHeight(box);
+	const need = Math.round(Math.max(bw, bh) * RUN_SHARE);
+	const keep = new Uint8Array(bw * bh);
+
+	for (let y = 0; y < bh; y++) {
+		let run = 0;
+		for (let x = 0; x <= bw; x++) {
+			if (x < bw && labels[(box.y0 + y) * w + box.x0 + x] === box.id) { run++; continue; }
+			if (run >= need) for (let k = x - run; k < x; k++) keep[y * bw + k] = 1;
+			run = 0;
+		}
+	}
+	for (let x = 0; x < bw; x++) {
+		let run = 0;
+		for (let y = 0; y <= bh; y++) {
+			if (y < bh && labels[(box.y0 + y) * w + box.x0 + x] === box.id) { run++; continue; }
+			if (run >= need) for (let k = y - run; k < y; k++) keep[k * bw + x] = 1;
+			run = 0;
+		}
+	}
+
+	const points = outlinePoints(keep, bw, { id: 1, x0: 0, y0: 0, x1: bw - 1, y1: bh - 1 });
+	for (const p of points) { p[0] += box.x0; p[1] += box.y0; }
+	return points;
 }
 
 function gridLikeness(gray, w, h, quad) {
@@ -612,10 +650,19 @@ function findGrid(gray, ink, w, h) {
 		const quad = quadOf(found.labels, w, candidate.box);
 		if (quad === null) continue;
 		const score = gridLikeness(gray, w, h, quad);
-		if (best === null || score > best.score) best = { quad: quad, score: score };
+		if (best === null || score > best.score) {
+			best = { quad: quad, score: score, box: candidate.box };
+		}
 		if (score > 0.8) break;
 	}
-	return best === null ? null : best.quad;
+	if (best === null) return null;
+
+	// So little line structure means something is stuck to the grid.
+	if (best.score < WEAK_GRID) {
+		const quad = quadFromPoints(latticePoints(found.labels, w, best.box));
+		if (quad !== null && gridLikeness(gray, w, h, quad) > best.score) return quad;
+	}
+	return best.quad;
 }
 
 /* --------------------------------------------------------------------- Cells */
