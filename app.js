@@ -543,6 +543,7 @@ function initUI() {
 			cells[i].classList.toggle("given", grid[i] !== 0 && given[i] === 1);
 			cells[i].classList.toggle("filled", Boolean(filled) && grid[i] !== 0 && given[i] === 0);
 			cells[i].classList.remove("conflict");
+			cells[i].classList.remove("uncertain");
 		}
 	}
 
@@ -550,6 +551,12 @@ function initUI() {
 		for (const c of conflicts) {
 			cells[c.index].classList.add("conflict");
 			cells[c.otherIndex].classList.add("conflict");
+		}
+	}
+
+	function markUncertain(flags) {
+		for (let i = 0; i < CELLS; i++) {
+			cells[i].classList.toggle("uncertain", flags[i] === 1);
 		}
 	}
 
@@ -631,6 +638,7 @@ function initUI() {
 		if (i < 0) return;
 		event.target.value = event.target.value.replace(/[^1-9]/g, "").slice(-1);
 		event.target.classList.remove("conflict");
+		event.target.classList.remove("uncertain");
 		given[i] = event.target.value === "" ? 0 : 1;
 		event.target.classList.toggle("given", given[i] === 1);
 		event.target.classList.remove("filled");
@@ -663,6 +671,16 @@ function initUI() {
 			event.target.select();
 		}
 	});
+
+	// Entry point for camera.js, which fills the board from a photo.
+	globalThis.Sudoku.ui = {
+		setStatus: setStatus,
+		setPuzzle: function (grid, uncertain) {
+			takeAsGiven(grid);
+			showGrid(grid, false);
+			if (uncertain) markUncertain(uncertain);
+		}
+	};
 
 	document.getElementById("generate").addEventListener("click", handleGenerate);
 	document.getElementById("check").addEventListener("click", handleCheck);

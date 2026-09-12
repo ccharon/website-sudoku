@@ -17,7 +17,7 @@ jobs:
         run: sudo npm install -g uglify-js uglifycss
 
       - name: Minify JS
-        run: uglifyjs app.js -o app.js -c -m
+        run: uglifyjs app.js -o app.js -c -m && uglifyjs camera.js -o camera.js -c -m
 
       - name: Minify CSS
         run: uglifycss style.css > style.css.tmp && mv style.css.tmp style.css
@@ -29,7 +29,7 @@ jobs:
           SHA=$(git rev-parse --short HEAD)
           git checkout --orphan dist-new
           git rm -rf . --cached
-          git add index.html style.css app.js icons/favicon.svg icons/favicon-32.png icons/apple-touch-icon.png
+          git add index.html style.css app.js camera.js icons/favicon.svg icons/favicon-32.png icons/apple-touch-icon.png
           git commit -m "dist: build from $SHA"
           git push origin HEAD:dist --force
 
