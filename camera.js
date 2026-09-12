@@ -11,13 +11,13 @@
 
 const S = globalThis.Sudoku;
 
-const WARP_CELL = 32;
-const WARP_SIZE = WARP_CELL * 9;
-const NORM = 24;            // side of a normalised digit bitmap
-const NORM_FIT = 18;        // the digit is scaled to fit this box
+const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
+const WARP_STILL = 80;      // pixels per cell for a single picture
+const NORM = 32;            // side of a normalised digit bitmap
+const NORM_FIT = 24;        // the digit is scaled to fit this box
 const CELL_INSET = 0.14;    // share of a cell dropped on each side
-const LIVE_SIDE = 800;      // frames from the camera are scaled to this
-const STILL_SIDE = 1280;    // a picked photo is scaled to this
+const LIVE_SIDE = 1024;     // frames from the camera are scaled to this
+const STILL_SIDE = 1600;    // a picked photo is scaled to this
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
 const AGREE_FRAMES = 3;     // live frames that must agree before accepting
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
@@ -299,7 +299,11 @@ function isolateDigit(mask, size, x0, y0, x1, y1) {
 
 	const digit = new Uint8Array(w * h);
 	for (let p = 0; p < w * h; p++) digit[p] = found.labels[p] === best.id ? 1 : 0;
-	return normalise(digit, w, best);
+	const norm = normalise(digit, w, best);
+	if (norm === null) return null;
+	const bw = best.x1 - best.x0 + 1;
+	const bh = best.y1 - best.y0 + 1;
+	return { mask: norm, holes: holeCount(digit, w, h, minHole(bw, bh)) };
 }
 
 /**
@@ -356,52 +360,60 @@ function distanceMap(bitmap) {
 	return dist;
 }
 
+/** A counter smaller than this share of the digit is threshold noise. */
+function minHole(bw, bh) {
+	return Math.max(2, Math.round(bw * bh * 0.004));
+}
+
 /**
  * Counts the background patches fully enclosed by ink. Distance alone cannot
  * tell a closed loop from an open hook, which is what separates 5 from 6 and
- * 3 from 8.
+ * 3 from 8. Counted before the bitmap is scaled down, because scaling closes
+ * the counters of bold faces.
  */
-function holeCount(mask) {
-	const n = NORM * NORM;
+function holeCount(bitmap, w, h, limit) {
+	const n = w * h;
 	const seen = new Uint8Array(n);
 	const stack = new Int32Array(n);
 	let top = 0;
 
-	function spread(limit) {
+	function step(q) {
+		if (bitmap[q] === 0 && seen[q] === 0) {
+			seen[q] = 1;
+			stack[top++] = q;
+		}
+	}
+
+	function flood() {
 		let size = 0;
 		while (top > 0) {
 			const p = stack[--top];
-			const x = p % NORM;
+			const x = p % w;
 			size++;
-			if (x > 0 && mask[p - 1] === 0 && seen[p - 1] === 0) { seen[p - 1] = 1; stack[top++] = p - 1; }
-			if (x < NORM - 1 && mask[p + 1] === 0 && seen[p + 1] === 0) { seen[p + 1] = 1; stack[top++] = p + 1; }
-			if (p >= NORM && mask[p - NORM] === 0 && seen[p - NORM] === 0) { seen[p - NORM] = 1; stack[top++] = p - NORM; }
-			if (p < n - NORM && mask[p + NORM] === 0 && seen[p + NORM] === 0) { seen[p + NORM] = 1; stack[top++] = p + NORM; }
-			if (size > limit) break;
+			if (x > 0) step(p - 1);
+			if (x < w - 1) step(p + 1);
+			if (p >= w) step(p - w);
+			if (p < n - w) step(p + w);
 		}
 		return size;
 	}
 
-	for (let i = 0; i < NORM; i++) {
-		const edge = [i, (NORM - 1) * NORM + i, i * NORM, i * NORM + NORM - 1];
-		for (const p of edge) {
-			if (mask[p] === 0 && seen[p] === 0) { seen[p] = 1; stack[top++] = p; }
-		}
-	}
-	spread(n);
+	for (let x = 0; x < w; x++) { step(x); step((h - 1) * w + x); }
+	for (let y = 0; y < h; y++) { step(y * w); step(y * w + w - 1); }
+	flood();
 
 	let holes = 0;
 	for (let start = 0; start < n; start++) {
-		if (mask[start] === 1 || seen[start] === 1) continue;
+		if (bitmap[start] === 1 || seen[start] === 1) continue;
 		seen[start] = 1;
 		stack[top++] = start;
-		if (spread(n) >= 3) holes++;    // single pixels are threshold noise
+		if (flood() >= limit) holes++;
 	}
 	return holes;
 }
 
-function shapeOf(mask) {
-	return { mask: mask, dist: distanceMap(mask), holes: holeCount(mask) };
+function shapeOf(mask, holes) {
+	return { mask: mask, dist: distanceMap(mask), holes: holes };
 }
 
 /** Distance plus the difference in enclosed areas. Lower fits better. */
@@ -483,7 +495,9 @@ function buildTemplates() {
 			const key = digit + ":" + mask.join("");
 			if (seen.has(key)) continue;    // the same face under another name
 			seen.add(key);
-			const shape = shapeOf(mask);
+			const holes = holeCount(bitmap, side, side,
+				minHole(box.x1 - box.x0 + 1, box.y1 - box.y0 + 1));
+			const shape = shapeOf(mask, holes);
 			shape.digit = digit;
 			out.push(shape);
 		}
@@ -491,12 +505,12 @@ function buildTemplates() {
 	return out;
 }
 
-/** Ranks the digits 1 to 9 for one normalised cell bitmap. */
-function classify(mask) {
-	const cell = shapeOf(mask);
+/** Ranks the digits 1 to 9 for one isolated cell. */
+function classify(cell) {
+	const shape = shapeOf(cell.mask, cell.holes);
 	const best = new Float64Array(10).fill(Infinity);
 	for (const template of templates) {
-		const score = shapeDistance(cell, template);
+		const score = shapeDistance(shape, template);
 		if (score < best[template.digit]) best[template.digit] = score;
 	}
 	const ranked = [];
@@ -511,7 +525,7 @@ function classify(mask) {
  * Runs the whole chain on one frame. Returns the grid, the ranking per cell
  * and how clearly each cell was decided.
  */
-function readImage(image) {
+function readImage(image, cellPx) {
 	if (templates === null) templates = buildTemplates();
 
 	const w = image.width;
@@ -522,9 +536,11 @@ function readImage(image) {
 	const quad = findGrid(ink, w, h);
 	if (quad === null) return { ok: false, reason: "no grid found" };
 
-	const flat = rectify(gray, w, h, quad, WARP_SIZE);
-	const flatInk = threshold(flat, WARP_SIZE, WARP_SIZE, Math.round(WARP_CELL / 2), 0.9);
-	const cells = cutCells(flatInk, WARP_SIZE);
+	const cell = cellPx || WARP_STILL;
+	const size = cell * 9;
+	const flat = rectify(gray, w, h, quad, size);
+	const flatInk = threshold(flat, size, size, Math.round(cell / 2), 0.9);
+	const cells = cutCells(flatInk, size);
 
 	const grid = S.emptyGrid();
 	const margin = new Float64Array(S.CELLS);
@@ -606,8 +622,8 @@ function uncertainCells(reading, fixed) {
 }
 
 /** Reads one frame and returns a grid the solver accepts, or a reason. */
-function readPuzzle(image) {
-	const reading = readImage(image);
+function readPuzzle(image, cellPx) {
+	const reading = readImage(image, cellPx);
 	if (!reading.ok) return reading;
 	const fixed = repair(reading);
 	if (fixed === null) {
@@ -734,7 +750,8 @@ function initPhoto() {
 			timer = setTimeout(tick, 200);
 			return;
 		}
-		const result = readPuzzle(pixelsOf(video, video.videoWidth, video.videoHeight, LIVE_SIDE));
+		const frame = pixelsOf(video, video.videoWidth, video.videoHeight, LIVE_SIDE);
+		const result = readPuzzle(frame, WARP_LIVE);
 		if (result.ok) {
 			const key = S.gridToString(result.grid);
 			agreed = key === agree ? agreed + 1 : 1;
@@ -749,7 +766,7 @@ function initPhoto() {
 			agreed = 0;
 			hint.textContent = "Point the camera at the puzzle";
 		}
-		timer = setTimeout(tick, 120);
+		timer = setTimeout(tick, 200);
 	}
 
 	/* Without a live picture the empty viewfinder is only in the way. */

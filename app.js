@@ -630,7 +630,6 @@ function initUI() {
 		given.fill(0);
 		showGrid(emptyGrid(), false);
 		setStatus("Enter digits, then solve.", false);
-		cells[0].focus();
 	}
 
 	boardEl.addEventListener("input", function (event) {
