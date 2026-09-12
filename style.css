@@ -73,6 +73,12 @@ h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
 	cursor: pointer;
 }
 
+.controls .icon-button {
+	display: inline-flex;
+	align-items: center;
+	padding: 0.4rem 0.6rem;
+}
+
 .controls button:hover { background: var(--panel); }
 .controls button:disabled { opacity: 0.5; cursor: default; }
 
