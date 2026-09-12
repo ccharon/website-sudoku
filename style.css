@@ -1,0 +1,75 @@
+:root {
+	--line: #c9c9c9;
+	--line-strong: #444;
+	--given: #1a1a1a;
+	--filled: #2a6ebb;
+	--conflict: #b00020;
+	--bg: #fdfdfc;
+	--panel: #f4f4f2;
+}
+
+* { box-sizing: border-box; }
+
+body {
+	margin: 0;
+	padding: 2rem 1rem;
+	background: var(--bg);
+	color: #1a1a1a;
+	font: 16px/1.5 system-ui, sans-serif;
+}
+
+main { max-width: 40rem; margin: 0 auto; }
+
+h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
+
+.status { margin: 0 0 0.75rem; min-height: 1.5rem; }
+.status.error { color: var(--conflict); }
+
+.board {
+	display: grid;
+	grid-template-columns: repeat(9, 1fr);
+	width: min(100%, 27rem);
+	border: 2px solid var(--line-strong);
+	background: #fff;
+}
+
+.cell {
+	aspect-ratio: 1;
+	min-width: 0;
+	border: 1px solid var(--line);
+	border-radius: 0;
+	text-align: center;
+	font-size: clamp(1rem, 4vw, 1.4rem);
+	font-variant-numeric: tabular-nums;
+	color: var(--filled);
+	background: #fff;
+}
+
+.cell.given { color: var(--given); font-weight: 600; background: var(--panel); }
+.cell.conflict { color: var(--conflict); background: #fdecef; }
+.cell:focus { outline: 2px solid var(--filled); outline-offset: -2px; z-index: 1; }
+
+/* Strong lines on the box borders. */
+.cell:nth-child(9n+4), .cell:nth-child(9n+7) { border-left-color: var(--line-strong); }
+.cell:nth-child(n+19):nth-child(-n+27), .cell:nth-child(n+46):nth-child(-n+54) {
+	border-bottom-color: var(--line-strong);
+}
+
+.controls {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	margin-top: 1rem;
+}
+
+.controls button {
+	padding: 0.4rem 0.8rem;
+	border: 1px solid var(--line-strong);
+	border-radius: 4px;
+	background: #fff;
+	font: inherit;
+	cursor: pointer;
+}
+
+.controls button:hover { background: var(--panel); }
+.controls button:disabled { opacity: 0.5; cursor: default; }

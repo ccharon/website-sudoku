@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="180" height="180">
+	<rect width="180" height="180" fill="#fdfdfc"/>
+	<g stroke="#1a1a1a" stroke-linecap="square">
+		<rect x="27" y="27" width="126" height="126" rx="6" fill="#fff" stroke-width="6"/>
+		<path d="M69 27V153M111 27V153M27 69H153M27 111H153" stroke-width="4"/>
+	</g>
+	<g font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="34"
+	   font-weight="600" text-anchor="middle" fill="#1a1a1a">
+		<text x="48" y="60">5</text>
+		<text x="132" y="60">3</text>
+		<text x="90" y="102" fill="#2a6ebb">7</text>
+		<text x="48" y="144">9</text>
+		<text x="132" y="144">2</text>
+	</g>
+</svg>

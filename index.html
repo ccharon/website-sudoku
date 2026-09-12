@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta name="description" content="Sudoku solver and generator, exact cover with dancing links">
+	<meta name="theme-color" content="#fdfdfc">
+	<title>Sudoku</title>
+
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-status-bar-style" content="default">
+	<meta name="apple-mobile-web-app-title" content="Sudoku">
+
+	<link rel="icon" type="image/svg+xml" href="icons/favicon.svg">
+	<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+	<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+
+	<link rel="stylesheet" href="style.css">
+	<script src="app.js" defer></script>
+</head>
+<body>
+	<main>
+		<h1>Sudoku</h1>
+		<p id="status" class="status" role="status">Enter digits, then solve.</p>
+		<div id="board" class="board"></div>
+		<div class="controls">
+			<button type="button" id="generate">New puzzle</button>
+			<button type="button" id="check">Check</button>
+			<button type="button" id="solve">Solve</button>
+			<button type="button" id="clear">Clear</button>
+		</div>
+	</main>
+</body>
+</html>
