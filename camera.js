@@ -20,6 +20,8 @@ const LIVE_SIDE = 1024;     // frames from the camera are scaled to this
 const STILL_SIDE = 1600;    // a picked photo is scaled to this
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
 const AGREE_FRAMES = 3;     // live frames that must agree before accepting
+const AGREE_WINDOW = 6;     // and the span of frames they may come from
+const LIVE_PAUSE = 80;      // rest between two frames, on top of the reading itself
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
 const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
 const INK_THIN = 0.78;      // stricter pass, used only for counting counters
@@ -121,10 +123,178 @@ function components(mask, w, h) {
 
 /* ----------------------------------------------------------- Grid detection */
 
+/** Convex hull of a point set, counter clockwise, monotone chain. */
+function convexHull(points) {
+	const p = points.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+	if (p.length < 3) return p;
+	const cross = function (o, a, b) {
+		return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+	};
+	const half = function (list) {
+		const out = [];
+		for (const q of list) {
+			while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], q) <= 0) out.pop();
+			out.push(q);
+		}
+		out.pop();
+		return out;
+	};
+	return half(p).concat(half(p.reverse()));
+}
+
+/** Drops hull points that barely bend, down to at most limit of them. */
+function simplifyHull(hull, limit) {
+	let out = hull;
+	let tolerance = 0.5;
+	while (out.length > limit) {
+		const kept = [];
+		for (let i = 0; i < out.length; i++) {
+			const a = out[(i + out.length - 1) % out.length];
+			const b = out[i];
+			const c = out[(i + 1) % out.length];
+			const span = Math.hypot(c[0] - a[0], c[1] - a[1]);
+			const away = Math.abs((c[0] - a[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (c[1] - a[1])) / (span || 1);
+			if (away >= tolerance) kept.push(b);
+		}
+		if (kept.length < 4 || kept.length === out.length) {
+			tolerance *= 2;
+			if (tolerance > 1e4) break;
+			continue;
+		}
+		out = kept;
+	}
+	return out;
+}
+
+function triangleArea(a, b, c) {
+	return Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+}
+
+/**
+ * The four hull points spanning the largest area. Unlike the extremes along
+ * the diagonals this survives rotation and a stray spur on the outline.
+ */
+function maxAreaQuad(hull) {
+	const n = hull.length;
+	if (n < 4) return null;
+	if (n === 4) return hull.slice();
+	let best = null;
+	let bestArea = -1;
+	for (let i = 0; i < n; i++) {
+		for (let j = i + 2; j < n; j++) {
+			let left = -1, leftAt = -1, right = -1, rightAt = -1;
+			for (let k = i + 1; k < j; k++) {
+				const t = triangleArea(hull[i], hull[k], hull[j]);
+				if (t > left) { left = t; leftAt = k; }
+			}
+			for (let k = j + 1; k < n + i; k++) {
+				const t = triangleArea(hull[j], hull[k % n], hull[i]);
+				if (t > right) { right = t; rightAt = k % n; }
+			}
+			if (leftAt < 0 || rightAt < 0) continue;
+			if (left + right > bestArea) {
+				bestArea = left + right;
+				best = [hull[i], hull[leftAt], hull[j], hull[rightAt]];
+			}
+		}
+	}
+	return best;
+}
+
+function distanceToSide(p, a, b) {
+	const vx = b[0] - a[0];
+	const vy = b[1] - a[1];
+	const len = vx * vx + vy * vy;
+	const t = len === 0 ? 0 : ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / len;
+	if (t < 0.08 || t > 0.92) return Infinity;    // corners belong to two sides
+	return Math.abs((p[0] - a[0]) * vy - (p[1] - a[1]) * vx) / Math.sqrt(len);
+}
+
+/** Line of least squared distance through the points, as nx*x + ny*y = c. */
+function fitLine(points) {
+	let sx = 0;
+	let sy = 0;
+	for (const p of points) { sx += p[0]; sy += p[1]; }
+	const mx = sx / points.length;
+	const my = sy / points.length;
+	let xx = 0, xy = 0, yy = 0;
+	for (const p of points) {
+		const dx = p[0] - mx;
+		const dy = p[1] - my;
+		xx += dx * dx; xy += dx * dy; yy += dy * dy;
+	}
+	const angle = 0.5 * Math.atan2(2 * xy, xx - yy);
+	const nx = -Math.sin(angle);
+	const ny = Math.cos(angle);
+	return [nx, ny, nx * mx + ny * my];
+}
+
+function crossLines(a, b) {
+	const det = a[0] * b[1] - b[0] * a[1];
+	if (Math.abs(det) < 1e-9) return null;
+	return [(a[2] * b[1] - b[2] * a[1]) / det, (a[0] * b[2] - b[0] * a[2]) / det];
+}
+
+/**
+ * Fits a line to each of the four sides and intersects them. A thin or blurred
+ * outline loses its corners, but the long sides survive, so the corner follows
+ * from them instead of from a pixel that may not be there.
+ */
+function refineQuad(quad, points) {
+	let current = quad;
+	for (let pass = 0; pass < 2; pass++) {
+		let span = 0;
+		for (let i = 0; i < 4; i++) {
+			const a = current[i];
+			const b = current[(i + 1) % 4];
+			span += Math.hypot(b[0] - a[0], b[1] - a[1]);
+		}
+		const near = span / 4 * 0.06;
+		const sides = [[], [], [], []];
+		for (const p of points) {
+			let at = -1;
+			let best = near;
+			for (let i = 0; i < 4; i++) {
+				const d = distanceToSide(p, current[i], current[(i + 1) % 4]);
+				if (d < best) { best = d; at = i; }
+			}
+			if (at >= 0) sides[at].push(p);
+		}
+		const lines = [];
+		for (const side of sides) {
+			if (side.length < 12) return current;
+			lines.push(fitLine(side));
+		}
+		const next = [];
+		for (let i = 0; i < 4; i++) {
+			const corner = crossLines(lines[(i + 3) % 4], lines[i]);
+			if (corner === null) return current;
+			next.push(corner);
+		}
+		current = next;
+	}
+	return current;
+}
+
+/** Brings the four corners into the order top left, top right, bottom right, bottom left. */
+function orderQuad(quad) {
+	let area = 0;
+	for (let i = 0; i < 4; i++) {
+		const a = quad[i];
+		const b = quad[(i + 1) % 4];
+		area += a[0] * b[1] - b[0] * a[1];
+	}
+	const ring = area < 0 ? quad.slice().reverse() : quad.slice();
+	let first = 0;
+	for (let i = 1; i < 4; i++) {
+		if (ring[i][0] + ring[i][1] < ring[first][0] + ring[first][1]) first = i;
+	}
+	return [ring[first], ring[(first + 1) % 4], ring[(first + 2) % 4], ring[(first + 3) % 4]];
+}
+
 /**
  * Picks the ink patch that looks like the grid frame: wide, roughly square and
- * an outline rather than a solid area. Returns the four corners in the order
- * top left, top right, bottom right, bottom left.
+ * an outline rather than a solid area, then takes its four corners.
  */
 function findGrid(mask, w, h) {
 	const found = components(mask, w, h);
@@ -142,21 +312,40 @@ function findGrid(mask, w, h) {
 	}
 	if (best === null) return null;
 
+	// Only the outermost pixel of each row and column can lie on a side.
 	const id = best.box.id;
-	let tl = null, tr = null, br = null, bl = null;
-	let tlV = Infinity, brV = -Infinity, trV = -Infinity, blV = Infinity;
+	const points = [];
 	for (let y = best.box.y0; y <= best.box.y1; y++) {
+		let from = -1;
+		let to = -1;
 		for (let x = best.box.x0; x <= best.box.x1; x++) {
 			if (found.labels[y * w + x] !== id) continue;
-			const sum = x + y;
-			const diff = x - y;
-			if (sum < tlV) { tlV = sum; tl = [x, y]; }
-			if (sum > brV) { brV = sum; br = [x, y]; }
-			if (diff > trV) { trV = diff; tr = [x, y]; }
-			if (diff < blV) { blV = diff; bl = [x, y]; }
+			if (from < 0) from = x;
+			to = x;
+		}
+		if (from >= 0) {
+			points.push([from, y]);
+			if (to !== from) points.push([to, y]);
 		}
 	}
-	const quad = [tl, tr, br, bl];
+	for (let x = best.box.x0; x <= best.box.x1; x++) {
+		let from = -1;
+		let to = -1;
+		for (let y = best.box.y0; y <= best.box.y1; y++) {
+			if (found.labels[y * w + x] !== id) continue;
+			if (from < 0) from = y;
+			to = y;
+		}
+		if (from >= 0) {
+			points.push([x, from]);
+			if (to !== from) points.push([x, to]);
+		}
+	}
+	if (points.length < 8) return null;
+
+	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
+	if (corners === null) return null;
+	const quad = orderQuad(refineQuad(orderQuad(corners), points));
 	return plausibleQuad(quad) ? quad : null;
 }
 
@@ -335,6 +524,12 @@ function gridBounds(ink, size) {
 	if (!trimmed) return null;
 	if (box.x1 - box.x0 < size * 0.5 || box.y1 - box.y0 < size * 0.5) return null;
 	return box;
+}
+
+/** Maps a point of the unit square onto the photo. */
+function quadPoint(m, u, v) {
+	const den = m.g * u + m.h * v + 1;
+	return [(m.a * u + m.b * v + m.c) / den, (m.d * u + m.e * v + m.f) / den];
 }
 
 /** Resamples a rectangle of the straightened image back to a full square. */
@@ -874,10 +1069,25 @@ function initPhoto() {
 
 	let stream = null;
 	let timer = 0;
-	let agree = null;
-	let agreed = 0;
+	const recent = [];
+
+	/*
+	 * How often this reading turned up in the last frames. A single odd frame
+	 * used to reset the count, which made the camera feel stuck.
+	 */
+	function timesSeen(key) {
+		recent.push(key);
+		if (recent.length > AGREE_WINDOW) recent.shift();
+		if (key === null) return 0;
+		let seen = 0;
+		for (const past of recent) {
+			if (past === key) seen++;
+		}
+		return seen;
+	}
 
 	function stop() {
+		recent.length = 0;
 		if (timer !== 0) { clearTimeout(timer); timer = 0; }
 		if (stream !== null) {
 			for (const track of stream.getTracks()) track.stop();
@@ -903,26 +1113,20 @@ function initPhoto() {
 	function tick() {
 		timer = 0;
 		if (stream === null || video.videoWidth === 0) {
-			timer = setTimeout(tick, 200);
+			timer = setTimeout(tick, LIVE_PAUSE);
 			return;
 		}
 		const frame = pixelsOf(video, video.videoWidth, video.videoHeight, LIVE_SIDE);
 		const result = readPuzzle(frame, WARP_LIVE);
-		if (result.ok) {
-			const key = S.gridToString(result.grid);
-			agreed = key === agree ? agreed + 1 : 1;
-			agree = key;
-			hint.textContent = `Grid found, holding still (${agreed}/${AGREE_FRAMES})`;
-			if (agreed >= AGREE_FRAMES) {
-				accept(result, "from the camera");
-				return;
-			}
-		} else {
-			agree = null;
-			agreed = 0;
-			hint.textContent = "Point the camera at the puzzle";
+		const seen = timesSeen(result.ok ? S.gridToString(result.grid) : null);
+		if (seen >= AGREE_FRAMES) {
+			accept(result, "from the camera");
+			return;
 		}
-		timer = setTimeout(tick, 200);
+		hint.textContent = result.ok
+			? `Grid found, hold still (${seen}/${AGREE_FRAMES})`
+			: "Point the camera at the puzzle";
+		timer = setTimeout(tick, LIVE_PAUSE);
 	}
 
 	/* Without a live picture the empty viewfinder is only in the way. */
@@ -934,8 +1138,7 @@ function initPhoto() {
 
 	async function open() {
 		overlay.hidden = false;
-		agree = null;
-		agreed = 0;
+		recent.length = 0;
 		hint.textContent = "Point the camera at the puzzle";
 		stage.hidden = false;
 		take.hidden = false;
