@@ -366,6 +366,8 @@ function rectQuad(rect) {
 
 /* ---------------------------------------------------------------- Grid lines */
 
+const LINE_GAP = 0.03;      // share of the image a line may be broken for, dotted rules included
+
 /**
  * Index steps of one direction: from one band to the next, and from one pixel
  * of a line to the next along it. With along set the bands are columns.
@@ -428,7 +430,7 @@ function bandExtent(ink, size, centre, along) {
 			if (first < 0) first = k;
 			last = k;
 			gap = 0;
-		} else if (first >= 0 && ++gap > 3) {
+		} else if (first >= 0 && ++gap > size * LINE_GAP) {
 			close();
 		}
 	}
@@ -734,6 +736,7 @@ function isolateDigit(ink, thin, size, rect, sourceScale) {
 		if (box.count < 5) continue;
 		if (bh < h * 0.22) continue;     // flat leftovers are grid lines
 		if (bw > w * 0.92) continue;     // a run across the cell is a line
+		if (bh > h * 0.92) continue;     // and so is one down the whole of it
 		// A digit sits in the middle, a piece of a dotted rule sits at the edge.
 		if (Math.abs((box.x0 + box.x1) / 2 - w / 2) > w * CELL_OFF) continue;
 		if (Math.abs((box.y0 + box.y1) / 2 - h / 2) > h * CELL_OFF) continue;
@@ -1004,6 +1007,8 @@ function classify(cell) {
 
 const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
 const WARP_STILL = 80;      // pixels per cell for a single picture
+const CUT_GAIN = 0.05;      // how much more regular the lines must get for a cut to count
+const CUT_SURE = 0.5;       // line score a cut must reach when the uncut grid scored nothing
 
 /** The ink mask of a straightened grid at one threshold. */
 function inkOf(plane, bias) {
@@ -1029,13 +1034,19 @@ function straighten(gray, w, h, cellPx) {
 		quad: quad
 	};
 
-	// The cut is kept only if the lines come out more regular for it.
+	/*
+	 * The cut is kept only if the lines come out more regular for it. A grid
+	 * that scored nothing gives any cut that edge, so such a cut must score
+	 * well on its own.
+	 */
 	const before = inkOf(plane, INK_BIAS);
 	const bounds = gridBounds(before, size);
 	if (bounds !== null) {
 		const cropped = rectify(plane.flat, size, size, rectQuad(bounds), size);
 		const after = threshold(cropped, size, size, plane.radius, INK_BIAS);
-		if (bandScore(after, size) > bandScore(before, size) + 0.05) {
+		const was = bandScore(before, size);
+		const now = bandScore(after, size);
+		if (now > was + CUT_GAIN && (was > 0 || now > CUT_SURE)) {
 			plane.flat = cropped;
 			plane.scale *= (bounds.y1 - bounds.y0) / size;
 		}
