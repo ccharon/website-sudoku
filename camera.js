@@ -39,6 +39,13 @@ function toGray(image) {
 	return gray;
 }
 
+/** The grey plane with light and dark exchanged, for a screen in dark mode. */
+function invertPlane(gray) {
+	const out = new Uint8ClampedArray(gray.length);
+	for (let i = 0; i < gray.length; i++) out[i] = 255 - gray[i];
+	return out;
+}
+
 /** Sums of a grey plane, one row and column larger than the image. */
 function integral(gray, w, h) {
 	const sum = new Float64Array((w + 1) * (h + 1));
@@ -956,13 +963,10 @@ function inkOf(plane, bias) {
 	return threshold(plane.flat, plane.size, plane.size, plane.radius, bias);
 }
 
-/** Finds the grid and straightens it, the costly half of a reading. */
-function straighten(image, cellPx) {
+/** Finds the grid in a grey plane and straightens it, the costly half of a reading. */
+function straighten(gray, w, h, cellPx) {
 	if (templates === null) templates = buildTemplates();
 
-	const w = image.width;
-	const h = image.height;
-	const gray = toGray(image);
 	const ink = threshold(gray, w, h, Math.max(4, Math.round(Math.min(w, h) / 24)), INK_FIND);
 
 	const quad = findGrid(gray, ink, w, h);
@@ -1019,9 +1023,9 @@ function readCells(plane, bias) {
 	};
 }
 
-/** Runs the whole chain on one frame at the usual threshold. */
+/** Runs the whole chain on one frame at the usual threshold, dark ink assumed. */
 function readImage(image, cellPx, bias) {
-	const plane = straighten(image, cellPx);
+	const plane = straighten(toGray(image), image.width, image.height, cellPx);
 	if (plane === null) return { ok: false, reason: "no grid found" };
 	return readCells(plane, bias || INK_BIAS);
 }
@@ -1141,14 +1145,11 @@ function uncertainCells(reading, fixed) {
 }
 
 /**
- * Reads one frame and returns a grid the solver accepts, or a reason. A bright
- * screen needs a softer threshold than paper and a stained one a harder, so
- * the thresholds are tried in turn until the reading holds up.
+ * Reads one straightened grid. A bright screen needs a softer threshold than
+ * paper and a stained one a harder, so the thresholds are tried in turn until
+ * the reading holds up.
  */
-function readPuzzle(image, cellPx) {
-	const plane = straighten(image, cellPx);
-	if (plane === null) return { ok: false, reason: "no grid found" };
-
+function readSolvable(plane) {
 	let last = null;
 	for (const bias of INK_TRIES) {
 		const reading = readCells(plane, bias);
@@ -1165,6 +1166,32 @@ function readPuzzle(image, cellPx) {
 		last = reading;
 	}
 	return { ok: false, reason: "grid read, but it does not solve", reading: last };
+}
+
+/** Reads one frame at one polarity, dark ink on a light ground unless reversed. */
+function readFrame(image, cellPx, dark) {
+	const gray = toGray(image);
+	const plane = straighten(dark ? invertPlane(gray) : gray,
+		image.width, image.height, cellPx);
+	if (plane === null) return { ok: false, reason: "no grid found" };
+	return readSolvable(plane);
+}
+
+/**
+ * Reads one frame and returns a grid the solver accepts, or a reason. Dark ink
+ * on a light ground is the usual case. A screen in dark mode turns it around,
+ * and neither the outline nor the digits survive that, so the whole chain runs
+ * a second time on the reversed plane.
+ */
+function readPuzzle(image, cellPx) {
+	let last = null;
+	for (const dark of [false, true]) {
+		const result = readFrame(image, cellPx, dark);
+		if (result.ok) return result;
+		// The first reading that got as far as the digits explains the failure best.
+		if (last === null && result.reading) last = result;
+	}
+	return last === null ? { ok: false, reason: "no grid found" } : last;
 }
 
 /* ------------------------------------------------------------------- Capture */
@@ -1197,6 +1224,7 @@ function loadImage(file) {
 const AGREE_FRAMES = 3;     // live frames that must agree before accepting
 const AGREE_WINDOW = 6;     // and the span of frames they may come from
 const LIVE_PAUSE = 80;      // rest between two frames, on top of the reading itself
+const PROBE_EVERY = 4;      // every so many live frames one is read the other way round
 
 function buildOverlay() {
 	const root = document.createElement("div");
@@ -1253,6 +1281,8 @@ function initPhoto() {
 
 	let stream = null;
 	let timer = 0;
+	let dark = false;
+	let frames = 0;
 	const recent = [];
 
 	/*
@@ -1272,6 +1302,8 @@ function initPhoto() {
 
 	function stop() {
 		recent.length = 0;
+		dark = false;
+		frames = 0;
 		if (timer !== 0) { clearTimeout(timer); timer = 0; }
 		if (stream !== null) {
 			for (const track of stream.getTracks()) track.stop();
@@ -1301,7 +1333,20 @@ function initPhoto() {
 			return;
 		}
 		const frame = pixelsOf(video, video.videoWidth, video.videoHeight, LIVE_SIDE);
-		const result = readPuzzle(frame, WARP_LIVE);
+		/*
+		 * One polarity per frame keeps an empty viewfinder cheap. Every fourth
+		 * frame tries the other one, and whichever carries a whole puzzle
+		 * becomes the one the rest of the frames use.
+		 */
+		const probe = (frames++ % PROBE_EVERY) === PROBE_EVERY - 1;
+		const turned = probe ? !dark : dark;
+		const result = readFrame(frame, WARP_LIVE, turned);
+		if (result.ok) dark = turned;
+		// An empty probe says nothing about the polarity in use, so it is dropped.
+		if (probe && !result.ok) {
+			timer = setTimeout(tick, LIVE_PAUSE);
+			return;
+		}
 		const seen = timesSeen(result.ok ? S.gridToString(result.grid) : null);
 		if (seen >= AGREE_FRAMES) {
 			accept(result, "from the camera");
@@ -1369,7 +1414,9 @@ function initPhoto() {
 	});
 }
 
-S.camera = { readImage: readImage, readPuzzle: readPuzzle, repair: repair };
+S.camera = {
+	readImage: readImage, readFrame: readFrame, readPuzzle: readPuzzle, repair: repair
+};
 
 if (typeof document !== "undefined") {
 	document.addEventListener("DOMContentLoaded", initPhoto);
