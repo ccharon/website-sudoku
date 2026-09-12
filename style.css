@@ -6,6 +6,7 @@
 	--conflict: #b00020;
 	--bg: #fdfdfc;
 	--panel: #f4f4f2;
+	--muted: #6b6b6b;
 	--unsure: #d98a00;
 }
 
@@ -44,6 +45,7 @@ h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
 	font-variant-numeric: tabular-nums;
 	color: var(--filled);
 	background: #fff;
+	touch-action: manipulation;
 }
 
 .cell.given { color: var(--given); font-weight: 600; background: var(--panel); }
@@ -73,6 +75,8 @@ h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
 	background: #fff;
 	font: inherit;
 	cursor: pointer;
+	/* Keeps a quick second tap from zooming the page. */
+	touch-action: manipulation;
 }
 
 /* The markup carries only the shapes, the drawing is set here. */
@@ -86,6 +90,15 @@ h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
 }
 
 .controls button svg .solid { fill: currentColor; stroke: none; }
+
+footer {
+	margin-top: 2rem;
+	font-size: 0.8rem;
+	line-height: 1.4;
+	color: var(--muted);
+}
+
+footer p { margin: 0.2rem 0; }
 
 .controls button:hover { background: var(--panel); }
 .controls button:disabled { opacity: 0.5; cursor: default; }
