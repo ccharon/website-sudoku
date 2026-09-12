@@ -19,12 +19,16 @@ const CELL_INSET = 0.14;    // share of a cell dropped on each side
 const LIVE_SIDE = 1024;     // frames from the camera are scaled to this
 const STILL_SIDE = 1600;    // a picked photo is scaled to this
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
+const FAINT_COST = 0.15;    // what it costs to read a digit into a nearly empty cell
 const AGREE_FRAMES = 3;     // live frames that must agree before accepting
 const AGREE_WINDOW = 6;     // and the span of frames they may come from
+const CANDIDATES = 6;       // ink patches examined before settling on one
+const SCORE_CELL = 24;      // cell size of the cheap pass that rates a candidate
 const LIVE_PAUSE = 80;      // rest between two frames, on top of the reading itself
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
 const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
 const INK_THIN = 0.78;      // stricter pass, used only for counting counters
+const INK_TRIES = [0.9, 0.96, 0.84];    // retried in this order until the reading solves
 const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
 
 /* ------------------------------------------------------------- Grey and ink */
@@ -292,34 +296,15 @@ function orderQuad(quad) {
 	return [ring[first], ring[(first + 1) % 4], ring[(first + 2) % 4], ring[(first + 3) % 4]];
 }
 
-/**
- * Picks the ink patch that looks like the grid frame: wide, roughly square and
- * an outline rather than a solid area, then takes its four corners.
- */
-function findGrid(mask, w, h) {
-	const found = components(mask, w, h);
-	const minArea = w * h * 0.04;
-	let best = null;
-	for (const box of found.boxes) {
-		const bw = box.x1 - box.x0 + 1;
-		const bh = box.y1 - box.y0 + 1;
-		const area = bw * bh;
-		if (area < minArea) continue;
-		if (bw / bh < 0.5 || bw / bh > 2) continue;
-		const fill = box.count / area;
-		if (fill < 0.02 || fill > 0.6) continue;
-		if (best === null || area > best.area) best = { box: box, area: area };
-	}
-	if (best === null) return null;
-
+/** The four corners of one ink patch, or null if it has too few pixels. */
+function quadOf(labels, w, box) {
 	// Only the outermost pixel of each row and column can lie on a side.
-	const id = best.box.id;
 	const points = [];
-	for (let y = best.box.y0; y <= best.box.y1; y++) {
+	for (let y = box.y0; y <= box.y1; y++) {
 		let from = -1;
 		let to = -1;
-		for (let x = best.box.x0; x <= best.box.x1; x++) {
-			if (found.labels[y * w + x] !== id) continue;
+		for (let x = box.x0; x <= box.x1; x++) {
+			if (labels[y * w + x] !== box.id) continue;
 			if (from < 0) from = x;
 			to = x;
 		}
@@ -328,11 +313,11 @@ function findGrid(mask, w, h) {
 			if (to !== from) points.push([to, y]);
 		}
 	}
-	for (let x = best.box.x0; x <= best.box.x1; x++) {
+	for (let x = box.x0; x <= box.x1; x++) {
 		let from = -1;
 		let to = -1;
-		for (let y = best.box.y0; y <= best.box.y1; y++) {
-			if (found.labels[y * w + x] !== id) continue;
+		for (let y = box.y0; y <= box.y1; y++) {
+			if (labels[y * w + x] !== box.id) continue;
 			if (from < 0) from = y;
 			to = y;
 		}
@@ -347,6 +332,69 @@ function findGrid(mask, w, h) {
 	if (corners === null) return null;
 	const quad = orderQuad(refineQuad(orderQuad(corners), points));
 	return plausibleQuad(quad) ? quad : null;
+}
+
+/**
+ * Rates how much the area inside the quadrilateral looks like a Sudoku: ten
+ * evenly spaced lines in both directions, spanning the whole of it. Without
+ * this the largest patch wins, which on a tablet is the bezel of the screen.
+ */
+function bandScore(ink, size) {
+	let score = 1;
+	for (let dir = 0; dir < 2; dir++) {
+		const bands = lineBands(ink, size, dir === 0);
+		if (bands.length < 8) return 0;
+		const steps = [];
+		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
+		const step = median(steps);
+		if (!(step > 0)) return 0;
+		const reach = bands[bands.length - 1] - bands[0];
+		const cells = Math.round(reach / step);
+		if (cells < 7 || cells > 11) return 0;
+		let drift = 0;
+		for (const d of steps) drift += Math.abs(d - step);
+		drift /= steps.length * step;
+		score *= Math.max(0, 1 - 4 * drift) * (reach / size) * (cells === S.SIZE ? 1 : 0.6);
+	}
+	return score;
+}
+
+function gridLikeness(gray, w, h, quad) {
+	const probe = SCORE_CELL * 9;
+	return bandScore(threshold(rectify(gray, w, h, quad, probe), probe, probe,
+		Math.round(SCORE_CELL / 2), INK_BIAS), probe);
+}
+
+/**
+ * Picks the ink patch that reads as a Sudoku. Candidates are wide, roughly
+ * square outlines rather than solid areas; the largest goes first, but the
+ * line structure decides.
+ */
+function findGrid(gray, ink, w, h) {
+	const found = components(ink, w, h);
+	const minArea = w * h * 0.02;
+	const candidates = [];
+	for (const box of found.boxes) {
+		const bw = box.x1 - box.x0 + 1;
+		const bh = box.y1 - box.y0 + 1;
+		const area = bw * bh;
+		if (area < minArea) continue;
+		if (bw / bh < 0.5 || bw / bh > 2) continue;
+		const fill = box.count / area;
+		if (fill < 0.02 || fill > 0.6) continue;
+		candidates.push({ box: box, area: area });
+	}
+	candidates.sort(function (a, b) { return b.area - a.area; });
+
+	let best = null;
+	for (const candidate of candidates.slice(0, CANDIDATES)) {
+		const quad = quadOf(found.labels, w, candidate.box);
+		if (quad === null) continue;
+		const score = gridLikeness(gray, w, h, quad);
+		if (best === null || score > best.score) best = { quad: quad, score: score };
+		if (score > 0.8) break;
+	}
+	return best === null ? null : best.quad;
 }
 
 /** Mean side length of the quadrilateral, in pixels of the photo. */
@@ -491,45 +539,40 @@ function median(values) {
 	return sorted[sorted.length >> 1];
 }
 
+/** Where the inner lines of one direction begin and end, across it. */
+function innerExtent(ink, size, bands, along) {
+	const firsts = [];
+	const lasts = [];
+	for (const centre of bands.slice(1, -1)) {
+		const span = bandExtent(ink, size, centre, along);
+		if (span[0] < 0) continue;
+		firsts.push(span[0]);
+		lasts.push(span[1]);
+	}
+	if (firsts.length === 0) return null;
+	return [median(firsts), median(lasts) + 1];
+}
+
 /**
  * Narrows the straightened image down to the 9x9 grid. Printed puzzles often
  * carry a title box that shares its bottom edge with the grid, so the outline
- * of the largest patch encloses ten rows. The inner lines betray the real
- * extent, because they stop at the grid.
+ * encloses ten rows. The inner lines betray the real extent, because they stop
+ * at the grid. Whether the cut is an improvement is decided by the caller.
  */
 function gridBounds(ink, size) {
 	const box = { x0: 0, y0: 0, x1: size, y1: size };
 	for (const along of [true, false]) {
 		const bands = lineBands(ink, size, along);
 		if (bands.length < 4) return null;
-		const firsts = [];
-		const lasts = [];
-		for (const centre of bands.slice(1, -1)) {
-			const span = bandExtent(ink, size, centre, along);
-			if (span[0] < 0) continue;
-			firsts.push(span[0]);
-			lasts.push(span[1]);
-		}
-		if (firsts.length === 0) return null;
-		if (along) {
-			box.y0 = median(firsts);
-			box.y1 = median(lasts) + 1;
-		} else {
-			box.x0 = median(firsts);
-			box.x1 = median(lasts) + 1;
-		}
+		const span = innerExtent(ink, size, bands, along);
+		if (span === null) return null;
+		if (along) { box.y0 = span[0]; box.y1 = span[1]; }
+		else { box.x0 = span[0]; box.x1 = span[1]; }
 	}
+	if (box.x1 - box.x0 < size * 0.5 || box.y1 - box.y0 < size * 0.5) return null;
 	const trimmed = box.x0 > size * 0.02 || box.y0 > size * 0.02 ||
 		box.x1 < size * 0.98 || box.y1 < size * 0.98;
-	if (!trimmed) return null;
-	if (box.x1 - box.x0 < size * 0.5 || box.y1 - box.y0 < size * 0.5) return null;
-	return box;
-}
-
-/** Maps a point of the unit square onto the photo. */
-function quadPoint(m, u, v) {
-	const den = m.g * u + m.h * v + 1;
-	return [(m.a * u + m.b * v + m.c) / den, (m.d * u + m.e * v + m.f) / den];
+	return trimmed ? box : null;
 }
 
 /** Resamples a rectangle of the straightened image back to a full square. */
@@ -606,19 +649,23 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 			ink += v;
 		}
 	}
-	if (ink < w * h * 0.02) return null;
+	if (ink < w * h * 0.006) return null;
 
 	const found = components(sub, w, h);
 	let best = null;
 	for (const box of found.boxes) {
 		const bw = box.x1 - box.x0 + 1;
 		const bh = box.y1 - box.y0 + 1;
-		if (box.count < 10) continue;
-		if (bh < h * 0.3) continue;      // flat leftovers are grid lines
+		if (box.count < 5) continue;
+		if (bh < h * 0.22) continue;     // flat leftovers are grid lines
 		if (bw > w * 0.92) continue;     // a run across the cell is a line
 		if (best === null || box.count > best.count) best = box;
 	}
 	if (best === null) return null;
+
+	// Too little of it to call a digit. Kept so the solver can still ask.
+	const faint = ink < w * h * 0.02 || best.count < 10 ||
+		(best.y1 - best.y0 + 1) < h * 0.3;
 
 	const digit = new Uint8Array(w * h);
 	for (let p = 0; p < w * h; p++) digit[p] = found.labels[p] === best.id ? 1 : 0;
@@ -638,7 +685,8 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 	return {
 		mask: norm,
 		holes: holeCount(slim, w, h, minHole(bw, bh)),
-		trust: Math.min(1, tall / HOLE_SURE)
+		trust: Math.min(1, tall / HOLE_SURE),
+		faint: faint
 	};
 }
 
@@ -863,11 +911,8 @@ function classify(cell) {
 
 /* ------------------------------------------------------------------ Reading */
 
-/**
- * Runs the whole chain on one frame. Returns the grid, the ranking per cell
- * and how clearly each cell was decided.
- */
-function readImage(image, cellPx) {
+/** Finds the grid and straightens it, the costly half of a reading. */
+function straighten(image, cellPx) {
 	if (templates === null) templates = buildTemplates();
 
 	const w = image.width;
@@ -875,35 +920,62 @@ function readImage(image, cellPx) {
 	const gray = toGray(image);
 	const ink = threshold(gray, w, h, Math.max(4, Math.round(Math.min(w, h) / 24)), 0.88);
 
-	const quad = findGrid(ink, w, h);
-	if (quad === null) return { ok: false, reason: "no grid found" };
+	const quad = findGrid(gray, ink, w, h);
+	if (quad === null) return null;
 
 	const cell = cellPx || WARP_STILL;
 	const size = cell * 9;
 	const radius = Math.round(cell / 2);
 	let flat = rectify(gray, w, h, quad, size);
-	let flatInk = threshold(flat, size, size, radius, INK_BIAS);
+	let scale = sideOf(quad) / size;
 
-	let sourceScale = sideOf(quad) / size;
-	const bounds = gridBounds(flatInk, size);
+	// The cut is kept only if the lines come out more regular for it.
+	const before = threshold(flat, size, size, radius, INK_BIAS);
+	const bounds = gridBounds(before, size);
 	if (bounds !== null) {
-		flat = cropSquare(flat, size, bounds, size);
-		flatInk = threshold(flat, size, size, radius, INK_BIAS);
-		sourceScale *= (bounds.y1 - bounds.y0) / size;
+		const cropped = cropSquare(flat, size, bounds, size);
+		const after = threshold(cropped, size, size, radius, INK_BIAS);
+		if (bandScore(after, size) > bandScore(before, size) + 0.05) {
+			flat = cropped;
+			scale *= (bounds.y1 - bounds.y0) / size;
+		}
 	}
-	const cells = cutCells(flatInk, threshold(flat, size, size, radius, INK_THIN), size, sourceScale);
+	return { flat: flat, size: size, radius: radius, scale: scale, quad: quad };
+}
+
+/**
+ * Reads the digits off the straightened grid at one ink threshold. Returns
+ * the grid, the ranking per cell and how clearly each cell was decided.
+ */
+function readCells(plane, bias) {
+	const ink = threshold(plane.flat, plane.size, plane.size, plane.radius, bias);
+	const thin = threshold(plane.flat, plane.size, plane.size, plane.radius,
+		bias - (INK_BIAS - INK_THIN));
+	const cells = cutCells(ink, thin, plane.size, plane.scale);
 
 	const grid = S.emptyGrid();
 	const margin = new Float64Array(S.CELLS);
+	const faint = new Uint8Array(S.CELLS);
 	const ranking = [];
 	for (let i = 0; i < S.CELLS; i++) {
 		if (cells[i] === null) { ranking.push(null); continue; }
 		const ranked = classify(cells[i]);
 		ranking.push(ranked);
-		grid[i] = ranked[0].digit;
+		faint[i] = cells[i].faint ? 1 : 0;
+		grid[i] = cells[i].faint ? 0 : ranked[0].digit;
 		margin[i] = ranked[1].score === 0 ? 0 : (ranked[1].score - ranked[0].score) / ranked[1].score;
 	}
-	return { ok: true, grid: grid, ranking: ranking, margin: margin, quad: quad };
+	return {
+		ok: true, grid: grid, ranking: ranking, margin: margin,
+		faint: faint, quad: plane.quad
+	};
+}
+
+/** Runs the whole chain on one frame at the usual threshold. */
+function readImage(image, cellPx, bias) {
+	const plane = straighten(image, cellPx);
+	if (plane === null) return { ok: false, reason: "no grid found" };
+	return readCells(plane, bias || INK_BIAS);
 }
 
 /* ------------------------------------------------------------------- Repair */
@@ -913,46 +985,78 @@ function unique(grid) {
 	return S.countSolutions(grid, 2) === 1;
 }
 
-function swap(reading, cells, choice) {
-	const grid = reading.grid.slice();
+/**
+ * The cells the reader was least sure of, each with the values it would still
+ * accept. A cell with barely any ink counts as empty but keeps its digits, so
+ * a missed given can be put back.
+ */
+function doubtfulCells(reading) {
+	const list = [];
+	for (let i = 0; i < S.CELLS; i++) {
+		const ranked = reading.ranking[i];
+		if (ranked === null) continue;
+		const options = [];
+		if (reading.faint[i] === 1) {
+			options.push({ digit: 0, cost: 0 });
+			for (let k = 0; k < 2; k++) {
+				options.push({
+					digit: ranked[k].digit,
+					cost: FAINT_COST + ranked[k].score - ranked[0].score
+				});
+			}
+		} else {
+			for (let k = 0; k < 3; k++) {
+				options.push({ digit: ranked[k].digit, cost: ranked[k].score - ranked[0].score });
+			}
+		}
+		list.push({
+			at: i,
+			options: options,
+			doubt: reading.faint[i] === 1 ? 1 : 1 - reading.margin[i]
+		});
+	}
+	list.sort(function (a, b) { return b.doubt - a.doubt; });
+	return list;
+}
+
+function swap(grid, cells, choice) {
+	const out = grid.slice();
+	const changed = [];
 	let cost = 0;
 	for (let k = 0; k < cells.length; k++) {
-		const ranked = reading.ranking[cells[k]];
-		grid[cells[k]] = ranked[choice[k]].digit;
-		cost += ranked[choice[k]].score - ranked[0].score;
+		const option = cells[k].options[choice[k]];
+		out[cells[k].at] = option.digit;
+		cost += option.cost;
+		changed.push(cells[k].at);
 	}
-	return { grid: grid, changed: cells.slice(), cost: cost };
+	return { grid: out, changed: changed, cost: cost };
 }
 
 /**
  * A correct reading has exactly one solution. If it has none or several, the
- * least certain cells are swapped for their runners up until it has.
+ * least certain cells are changed until it has.
  */
 function repair(reading) {
 	if (unique(reading.grid)) return { grid: reading.grid, changed: [] };
 
-	const order = [];
-	for (let i = 0; i < S.CELLS; i++) {
-		if (reading.ranking[i] !== null) order.push(i);
-	}
-	order.sort(function (a, b) { return reading.margin[a] - reading.margin[b]; });
-
+	const doubtful = doubtfulCells(reading);
 	let found = null;
-	for (const i of order.slice(0, 14)) {
-		for (let k = 1; k < 3; k++) {
-			const candidate = swap(reading, [i], [k]);
+
+	for (const cell of doubtful.slice(0, 16)) {
+		for (let k = 1; k < cell.options.length; k++) {
+			const candidate = swap(reading.grid, [cell], [k]);
 			if (!unique(candidate.grid)) continue;
 			if (found === null || candidate.cost < found.cost) found = candidate;
 		}
 	}
 	if (found !== null) return found;
 
-	const pairs = order.slice(0, 9);
+	const pairs = doubtful.slice(0, 10);
 	for (let a = 0; a < pairs.length; a++) {
 		for (let b = a + 1; b < pairs.length; b++) {
-			for (let ka = 1; ka < 3; ka++) {
-				for (let kb = 1; kb < 3; kb++) {
-					const candidate = swap(reading, [pairs[a], pairs[b]], [ka, kb]);
+			for (let ka = 1; ka < pairs[a].options.length; ka++) {
+				for (let kb = 1; kb < pairs[b].options.length; kb++) {
+					const candidate = swap(reading.grid, [pairs[a], pairs[b]], [ka, kb]);
 					if (!unique(candidate.grid)) continue;
 					if (found === null || candidate.cost < found.cost) found = candidate;
 				}
@@ -966,27 +1070,38 @@ function repair(reading) {
 function uncertainCells(reading, fixed) {
 	const flags = new Uint8Array(S.CELLS);
 	for (let i = 0; i < S.CELLS; i++) {
-		if (reading.ranking[i] !== null && reading.margin[i] < SURE_MARGIN) flags[i] = 1;
+		if (reading.ranking[i] === null) continue;
+		if (reading.faint[i] === 1 || reading.margin[i] < SURE_MARGIN) flags[i] = 1;
 	}
 	for (const i of fixed.changed) flags[i] = 1;
 	return flags;
 }
 
-/** Reads one frame and returns a grid the solver accepts, or a reason. */
+/**
+ * Reads one frame and returns a grid the solver accepts, or a reason. A bright
+ * screen needs a softer threshold than paper and a stained one a harder, so
+ * the thresholds are tried in turn until the reading holds up.
+ */
 function readPuzzle(image, cellPx) {
-	const reading = readImage(image, cellPx);
-	if (!reading.ok) return reading;
-	const fixed = repair(reading);
-	if (fixed === null) {
-		return { ok: false, reason: "grid read, but it does not solve", reading: reading };
+	const plane = straighten(image, cellPx);
+	if (plane === null) return { ok: false, reason: "no grid found" };
+
+	let last = null;
+	for (const bias of INK_TRIES) {
+		const reading = readCells(plane, bias);
+		const fixed = repair(reading);
+		if (fixed !== null) {
+			return {
+				ok: true,
+				grid: fixed.grid,
+				changed: fixed.changed,
+				uncertain: uncertainCells(reading, fixed),
+				reading: reading
+			};
+		}
+		last = reading;
 	}
-	return {
-		ok: true,
-		grid: fixed.grid,
-		changed: fixed.changed,
-		uncertain: uncertainCells(reading, fixed),
-		reading: reading
-	};
+	return { ok: false, reason: "grid read, but it does not solve", reading: last };
 }
 
 /* ---------------------------------------------------------------- Capture */
