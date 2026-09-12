@@ -24,6 +24,7 @@ const S = globalThis.Sudoku;
 
 const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
 const INK_THIN = 0.78;      // stricter pass, used only for counting counters
+const THIN_KEEP = 0.6;      // ink the stricter pass must retain to be believed
 const INK_TRIES = [0.9, 0.96, 0.84];    // retried in this order until the reading solves
 
 /** Returns the luma plane of an ImageData. */
@@ -588,6 +589,7 @@ function findGrid(gray, ink, w, h) {
 /* --------------------------------------------------------------------- Cells */
 
 const CELL_INSET = 0.14;    // share of a cell dropped on each side
+const CELL_OFF = 0.36;      // how far off centre a digit may sit inside a cell
 const NORM = 32;            // side of a normalised digit bitmap
 const NORM_FIT = 24;        // the digit is scaled to fit this box
 
@@ -659,6 +661,9 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 		if (box.count < 5) continue;
 		if (bh < h * 0.22) continue;     // flat leftovers are grid lines
 		if (bw > w * 0.92) continue;     // a run across the cell is a line
+		// A digit sits in the middle, a piece of a dotted rule sits at the edge.
+		if (Math.abs((box.x0 + box.x1) / 2 - w / 2) > w * CELL_OFF) continue;
+		if (Math.abs((box.y0 + box.y1) / 2 - h / 2) > h * CELL_OFF) continue;
 		if (best === null || box.count > best.count) best = box;
 	}
 	if (best === null) return null;
@@ -674,17 +679,26 @@ function isolateDigit(mask, thin, size, x0, y0, x1, y1, sourceScale) {
 	const bw = best.x1 - best.x0 + 1;
 	const bh = best.y1 - best.y0 + 1;
 
-	// Counters are counted on the thinner pass, where a narrow opening survives.
+	/*
+	 * Thick ink closes a counter, which only the stricter pass still sees. Weak
+	 * ink breaks a loop open, which only the fuller pass still closes. Which of
+	 * the two to believe shows in how much ink the stricter pass keeps.
+	 */
 	const slim = new Uint8Array(w * h);
+	let full = 0;
+	let kept = 0;
 	for (let y = best.y0; y <= best.y1; y++) {
 		for (let x = best.x0; x <= best.x1; x++) {
 			slim[y * w + x] = thin[(y0 + y) * size + x0 + x];
+			full += digit[y * w + x];
+			kept += slim[y * w + x];
 		}
 	}
+	const counted = kept > full * THIN_KEEP ? slim : digit;
 	const tall = bh * sourceScale;
 	return {
 		mask: norm,
-		holes: holeCount(slim, w, h, minHole(bw, bh)),
+		holes: holeCount(counted, w, h, minHole(bw, bh)),
 		trust: Math.min(1, tall / HOLE_SURE),
 		faint: faint
 	};
