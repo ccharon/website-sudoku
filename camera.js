@@ -1,37 +1,30 @@
 "use strict";
 
 /*
- * Reads a Sudoku from a photo. The image is thresholded, the grid frame is
- * located and rectified to a square, every cell is normalised, and the digits
- * are matched against templates rendered from the browser's own fonts. The
- * solver then checks the reading and repairs the least certain cells.
+ * Reads a Sudoku from a photo. The sections below follow the way through:
+ *
+ *   Image and ink     grey plane, adaptive threshold, connected patches
+ *   Geometry          hulls, lines, quadrilaterals, the perspective map
+ *   Grid lines        where the lines of a straightened grid lie
+ *   Grid detection    which ink patch is the Sudoku, and its four corners
+ *   Cells             one digit per cell, freed and normalised
+ *   Shape matching    distance between two digit shapes
+ *   Templates         the digits 1 to 9, rendered from the browser's fonts
+ *   Reading           straighten once, then read the digits off it
+ *   Repair            the solver checks the reading and mends it
+ *   Capture           pixels out of the camera or a picked file
+ *   Display           the viewfinder and what it reports
  */
 
 (function () {
 
 const S = globalThis.Sudoku;
 
-const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
-const WARP_STILL = 80;      // pixels per cell for a single picture
-const NORM = 32;            // side of a normalised digit bitmap
-const NORM_FIT = 24;        // the digit is scaled to fit this box
-const CELL_INSET = 0.14;    // share of a cell dropped on each side
-const LIVE_SIDE = 1024;     // frames from the camera are scaled to this
-const STILL_SIDE = 1600;    // a picked photo is scaled to this
-const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
-const FAINT_COST = 0.15;    // what it costs to read a digit into a nearly empty cell
-const AGREE_FRAMES = 3;     // live frames that must agree before accepting
-const AGREE_WINDOW = 6;     // and the span of frames they may come from
-const CANDIDATES = 6;       // ink patches examined before settling on one
-const SCORE_CELL = 24;      // cell size of the cheap pass that rates a candidate
-const LIVE_PAUSE = 80;      // rest between two frames, on top of the reading itself
-const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
+/* ------------------------------------------------------------- Image and ink */
+
 const INK_BIAS = 0.9;       // darker than this share of the local mean counts as ink
 const INK_THIN = 0.78;      // stricter pass, used only for counting counters
 const INK_TRIES = [0.9, 0.96, 0.84];    // retried in this order until the reading solves
-const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
-
-/* ------------------------------------------------------------- Grey and ink */
 
 /** Returns the luma plane of an ImageData. */
 function toGray(image) {
@@ -81,8 +74,6 @@ function threshold(gray, w, h, radius, bias) {
 	return mask;
 }
 
-/* --------------------------------------------------------------- Components */
-
 /**
  * Labels the connected patches of ink, eight-connected. Returns one entry per
  * label with its pixel count and bounding box.
@@ -125,7 +116,16 @@ function components(mask, w, h) {
 	return { labels: labels, boxes: boxes };
 }
 
-/* ----------------------------------------------------------- Grid detection */
+/* ------------------------------------------------------------------ Geometry */
+
+function median(values) {
+	const sorted = values.slice().sort(function (a, b) { return a - b; });
+	return sorted[sorted.length >> 1];
+}
+
+function triangleArea(a, b, c) {
+	return Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
+}
 
 /** Convex hull of a point set, counter clockwise, monotone chain. */
 function convexHull(points) {
@@ -168,10 +168,6 @@ function simplifyHull(hull, limit) {
 		out = kept;
 	}
 	return out;
-}
-
-function triangleArea(a, b, c) {
-	return Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])) / 2;
 }
 
 /**
@@ -239,47 +235,6 @@ function crossLines(a, b) {
 	return [(a[2] * b[1] - b[2] * a[1]) / det, (a[0] * b[2] - b[0] * a[2]) / det];
 }
 
-/**
- * Fits a line to each of the four sides and intersects them. A thin or blurred
- * outline loses its corners, but the long sides survive, so the corner follows
- * from them instead of from a pixel that may not be there.
- */
-function refineQuad(quad, points) {
-	let current = quad;
-	for (let pass = 0; pass < 2; pass++) {
-		let span = 0;
-		for (let i = 0; i < 4; i++) {
-			const a = current[i];
-			const b = current[(i + 1) % 4];
-			span += Math.hypot(b[0] - a[0], b[1] - a[1]);
-		}
-		const near = span / 4 * 0.06;
-		const sides = [[], [], [], []];
-		for (const p of points) {
-			let at = -1;
-			let best = near;
-			for (let i = 0; i < 4; i++) {
-				const d = distanceToSide(p, current[i], current[(i + 1) % 4]);
-				if (d < best) { best = d; at = i; }
-			}
-			if (at >= 0) sides[at].push(p);
-		}
-		const lines = [];
-		for (const side of sides) {
-			if (side.length < 12) return current;
-			lines.push(fitLine(side));
-		}
-		const next = [];
-		for (let i = 0; i < 4; i++) {
-			const corner = crossLines(lines[(i + 3) % 4], lines[i]);
-			if (corner === null) return current;
-			next.push(corner);
-		}
-		current = next;
-	}
-	return current;
-}
-
 /** Brings the four corners into the order top left, top right, bottom right, bottom left. */
 function orderQuad(quad) {
 	let area = 0;
@@ -296,118 +251,6 @@ function orderQuad(quad) {
 	return [ring[first], ring[(first + 1) % 4], ring[(first + 2) % 4], ring[(first + 3) % 4]];
 }
 
-/** The four corners of one ink patch, or null if it has too few pixels. */
-function quadOf(labels, w, box) {
-	// Only the outermost pixel of each row and column can lie on a side.
-	const points = [];
-	for (let y = box.y0; y <= box.y1; y++) {
-		let from = -1;
-		let to = -1;
-		for (let x = box.x0; x <= box.x1; x++) {
-			if (labels[y * w + x] !== box.id) continue;
-			if (from < 0) from = x;
-			to = x;
-		}
-		if (from >= 0) {
-			points.push([from, y]);
-			if (to !== from) points.push([to, y]);
-		}
-	}
-	for (let x = box.x0; x <= box.x1; x++) {
-		let from = -1;
-		let to = -1;
-		for (let y = box.y0; y <= box.y1; y++) {
-			if (labels[y * w + x] !== box.id) continue;
-			if (from < 0) from = y;
-			to = y;
-		}
-		if (from >= 0) {
-			points.push([x, from]);
-			if (to !== from) points.push([x, to]);
-		}
-	}
-	if (points.length < 8) return null;
-
-	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
-	if (corners === null) return null;
-	const quad = orderQuad(refineQuad(orderQuad(corners), points));
-	return plausibleQuad(quad) ? quad : null;
-}
-
-/**
- * Rates how much the area inside the quadrilateral looks like a Sudoku: ten
- * evenly spaced lines in both directions, spanning the whole of it. Without
- * this the largest patch wins, which on a tablet is the bezel of the screen.
- */
-function bandScore(ink, size) {
-	let score = 1;
-	for (let dir = 0; dir < 2; dir++) {
-		const bands = lineBands(ink, size, dir === 0);
-		if (bands.length < 8) return 0;
-		const steps = [];
-		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
-		const step = median(steps);
-		if (!(step > 0)) return 0;
-		const reach = bands[bands.length - 1] - bands[0];
-		const cells = Math.round(reach / step);
-		if (cells < 7 || cells > 11) return 0;
-		let drift = 0;
-		for (const d of steps) drift += Math.abs(d - step);
-		drift /= steps.length * step;
-		score *= Math.max(0, 1 - 4 * drift) * (reach / size) * (cells === S.SIZE ? 1 : 0.6);
-	}
-	return score;
-}
-
-function gridLikeness(gray, w, h, quad) {
-	const probe = SCORE_CELL * 9;
-	return bandScore(threshold(rectify(gray, w, h, quad, probe), probe, probe,
-		Math.round(SCORE_CELL / 2), INK_BIAS), probe);
-}
-
-/**
- * Picks the ink patch that reads as a Sudoku. Candidates are wide, roughly
- * square outlines rather than solid areas; the largest goes first, but the
- * line structure decides.
- */
-function findGrid(gray, ink, w, h) {
-	const found = components(ink, w, h);
-	const minArea = w * h * 0.02;
-	const candidates = [];
-	for (const box of found.boxes) {
-		const bw = box.x1 - box.x0 + 1;
-		const bh = box.y1 - box.y0 + 1;
-		const area = bw * bh;
-		if (area < minArea) continue;
-		if (bw / bh < 0.5 || bw / bh > 2) continue;
-		const fill = box.count / area;
-		if (fill < 0.02 || fill > 0.6) continue;
-		candidates.push({ box: box, area: area });
-	}
-	candidates.sort(function (a, b) { return b.area - a.area; });
-
-	let best = null;
-	for (const candidate of candidates.slice(0, CANDIDATES)) {
-		const quad = quadOf(found.labels, w, candidate.box);
-		if (quad === null) continue;
-		const score = gridLikeness(gray, w, h, quad);
-		if (best === null || score > best.score) best = { quad: quad, score: score };
-		if (score > 0.8) break;
-	}
-	return best === null ? null : best.quad;
-}
-
-/** Mean side length of the quadrilateral, in pixels of the photo. */
-function sideOf(quad) {
-	let sum = 0;
-	for (let i = 0; i < 4; i++) {
-		const a = quad[i];
-		const b = quad[(i + 1) % 4];
-		sum += Math.hypot(b[0] - a[0], b[1] - a[1]);
-	}
-	return sum / 4;
-}
-
 /** Rejects quadrilaterals too lopsided to be a photographed grid. */
 function plausibleQuad(quad) {
 	let shortest = Infinity;
@@ -422,7 +265,16 @@ function plausibleQuad(quad) {
 	return shortest > 8 && longest / shortest < 2.5;
 }
 
-/* ---------------------------------------------------------------- Rectify */
+/** Mean side length of the quadrilateral, in pixels of the photo. */
+function sideOf(quad) {
+	let sum = 0;
+	for (let i = 0; i < 4; i++) {
+		const a = quad[i];
+		const b = quad[(i + 1) % 4];
+		sum += Math.hypot(b[0] - a[0], b[1] - a[1]);
+	}
+	return sum / 4;
+}
 
 /** Maps the unit square onto the quadrilateral, after Heckbert. */
 function unitToQuad(quad) {
@@ -473,6 +325,22 @@ function rectify(gray, w, h, quad, size) {
 	}
 	return out;
 }
+
+/** Resamples a rectangle of the straightened image back to a full square. */
+function cropSquare(flat, size, box, out) {
+	const bw = box.x1 - box.x0;
+	const bh = box.y1 - box.y0;
+	const result = new Uint8ClampedArray(out * out);
+	for (let j = 0; j < out; j++) {
+		const sy = box.y0 + (j + 0.5) * bh / out;
+		for (let i = 0; i < out; i++) {
+			result[j * out + i] = sample(flat, size, size, box.x0 + (i + 0.5) * bw / out, sy);
+		}
+	}
+	return result;
+}
+
+/* ---------------------------------------------------------------- Grid lines */
 
 /** Centres of the runs of pixels that carry a line across the whole image. */
 function lineBands(ink, size, along) {
@@ -534,11 +402,6 @@ function bandExtent(ink, size, centre, along) {
 	return [bestFirst, bestLast];
 }
 
-function median(values) {
-	const sorted = values.slice().sort(function (a, b) { return a - b; });
-	return sorted[sorted.length >> 1];
-}
-
 /** Where the inner lines of one direction begin and end, across it. */
 function innerExtent(ink, size, bands, along) {
 	const firsts = [];
@@ -551,6 +414,31 @@ function innerExtent(ink, size, bands, along) {
 	}
 	if (firsts.length === 0) return null;
 	return [median(firsts), median(lasts) + 1];
+}
+
+/**
+ * Rates how much the area inside the quadrilateral looks like a Sudoku: ten
+ * evenly spaced lines in both directions, spanning the whole of it. Without
+ * this the largest patch wins, which on a tablet is the bezel of the screen.
+ */
+function bandScore(ink, size) {
+	let score = 1;
+	for (let dir = 0; dir < 2; dir++) {
+		const bands = lineBands(ink, size, dir === 0);
+		if (bands.length < 8) return 0;
+		const steps = [];
+		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
+		const step = median(steps);
+		if (!(step > 0)) return 0;
+		const reach = bands[bands.length - 1] - bands[0];
+		const cells = Math.round(reach / step);
+		if (cells < 7 || cells > 11) return 0;
+		let drift = 0;
+		for (const d of steps) drift += Math.abs(d - step);
+		drift /= steps.length * step;
+		score *= Math.max(0, 1 - 4 * drift) * (reach / size) * (cells === S.SIZE ? 1 : 0.6);
+	}
+	return score;
 }
 
 /**
@@ -575,21 +463,133 @@ function gridBounds(ink, size) {
 	return trimmed ? box : null;
 }
 
-/** Resamples a rectangle of the straightened image back to a full square. */
-function cropSquare(flat, size, box, out) {
-	const bw = box.x1 - box.x0;
-	const bh = box.y1 - box.y0;
-	const result = new Uint8ClampedArray(out * out);
-	for (let j = 0; j < out; j++) {
-		const sy = box.y0 + (j + 0.5) * bh / out;
-		for (let i = 0; i < out; i++) {
-			result[j * out + i] = sample(flat, size, size, box.x0 + (i + 0.5) * bw / out, sy);
+/* ------------------------------------------------------------ Grid detection */
+
+const CANDIDATES = 6;       // ink patches examined before settling on one
+const SCORE_CELL = 24;      // cell size of the cheap pass that rates a candidate
+
+/**
+ * Fits a line to each of the four sides and intersects them. A thin or blurred
+ * outline loses its corners, but the long sides survive, so the corner follows
+ * from them instead of from a pixel that may not be there.
+ */
+function refineQuad(quad, points) {
+	let current = quad;
+	for (let pass = 0; pass < 2; pass++) {
+		let span = 0;
+		for (let i = 0; i < 4; i++) {
+			const a = current[i];
+			const b = current[(i + 1) % 4];
+			span += Math.hypot(b[0] - a[0], b[1] - a[1]);
 		}
+		const near = span / 4 * 0.06;
+		const sides = [[], [], [], []];
+		for (const p of points) {
+			let at = -1;
+			let best = near;
+			for (let i = 0; i < 4; i++) {
+				const d = distanceToSide(p, current[i], current[(i + 1) % 4]);
+				if (d < best) { best = d; at = i; }
+			}
+			if (at >= 0) sides[at].push(p);
+		}
+		const lines = [];
+		for (const side of sides) {
+			if (side.length < 12) return current;
+			lines.push(fitLine(side));
+		}
+		const next = [];
+		for (let i = 0; i < 4; i++) {
+			const corner = crossLines(lines[(i + 3) % 4], lines[i]);
+			if (corner === null) return current;
+			next.push(corner);
+		}
+		current = next;
 	}
-	return result;
+	return current;
 }
 
-/* ------------------------------------------------------------------ Cells */
+/** The four corners of one ink patch, or null if it has too few pixels. */
+function quadOf(labels, w, box) {
+	// Only the outermost pixel of each row and column can lie on a side.
+	const points = [];
+	for (let y = box.y0; y <= box.y1; y++) {
+		let from = -1;
+		let to = -1;
+		for (let x = box.x0; x <= box.x1; x++) {
+			if (labels[y * w + x] !== box.id) continue;
+			if (from < 0) from = x;
+			to = x;
+		}
+		if (from >= 0) {
+			points.push([from, y]);
+			if (to !== from) points.push([to, y]);
+		}
+	}
+	for (let x = box.x0; x <= box.x1; x++) {
+		let from = -1;
+		let to = -1;
+		for (let y = box.y0; y <= box.y1; y++) {
+			if (labels[y * w + x] !== box.id) continue;
+			if (from < 0) from = y;
+			to = y;
+		}
+		if (from >= 0) {
+			points.push([x, from]);
+			if (to !== from) points.push([x, to]);
+		}
+	}
+	if (points.length < 8) return null;
+
+	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
+	if (corners === null) return null;
+	const quad = orderQuad(refineQuad(orderQuad(corners), points));
+	return plausibleQuad(quad) ? quad : null;
+}
+
+function gridLikeness(gray, w, h, quad) {
+	const probe = SCORE_CELL * 9;
+	return bandScore(threshold(rectify(gray, w, h, quad, probe), probe, probe,
+		Math.round(SCORE_CELL / 2), INK_BIAS), probe);
+}
+
+/**
+ * Picks the ink patch that reads as a Sudoku. Candidates are wide, roughly
+ * square outlines rather than solid areas; the largest goes first, but the
+ * line structure decides.
+ */
+function findGrid(gray, ink, w, h) {
+	const found = components(ink, w, h);
+	const minArea = w * h * 0.02;
+	const candidates = [];
+	for (const box of found.boxes) {
+		const bw = box.x1 - box.x0 + 1;
+		const bh = box.y1 - box.y0 + 1;
+		const area = bw * bh;
+		if (area < minArea) continue;
+		if (bw / bh < 0.5 || bw / bh > 2) continue;
+		const fill = box.count / area;
+		if (fill < 0.02 || fill > 0.6) continue;
+		candidates.push({ box: box, area: area });
+	}
+	candidates.sort(function (a, b) { return b.area - a.area; });
+
+	let best = null;
+	for (const candidate of candidates.slice(0, CANDIDATES)) {
+		const quad = quadOf(found.labels, w, candidate.box);
+		if (quad === null) continue;
+		const score = gridLikeness(gray, w, h, quad);
+		if (best === null || score > best.score) best = { quad: quad, score: score };
+		if (score > 0.8) break;
+	}
+	return best === null ? null : best.quad;
+}
+
+/* --------------------------------------------------------------------- Cells */
+
+const CELL_INSET = 0.14;    // share of a cell dropped on each side
+const NORM = 32;            // side of a normalised digit bitmap
+const NORM_FIT = 24;        // the digit is scaled to fit this box
 
 /**
  * Scales the digit to a fixed box and centres it by its centre of mass, so
@@ -709,7 +709,10 @@ function cutCells(mask, thin, size, sourceScale) {
 	return out;
 }
 
-/* --------------------------------------------------------- Shape matching */
+/* ------------------------------------------------------------ Shape matching */
+
+const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
+const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
 
 /** Chamfer distance to the nearest ink pixel, two passes over the bitmap. */
 function distanceMap(bitmap) {
@@ -801,16 +804,6 @@ function shapeOf(mask, holes, trust) {
 	return { mask: mask, dist: distanceMap(mask), holes: holes, trust: trust };
 }
 
-/**
- * Distance plus the difference in enclosed areas, weighted by how well the
- * cell resolves them. A digit twelve pixels tall closes its own counters, so
- * counting them there would decide against the right digit.
- */
-function shapeDistance(cell, template) {
-	return chamfer(cell, template) +
-		HOLE_COST * cell.trust * Math.abs(cell.holes - template.holes);
-}
-
 /** Symmetric mean distance between two digit bitmaps. */
 function chamfer(a, b) {
 	let sum = 0;
@@ -822,7 +815,17 @@ function chamfer(a, b) {
 	return count === 0 ? Infinity : sum / count;
 }
 
-/* ---------------------------------------------------------------- Templates */
+/**
+ * Distance plus the difference in enclosed areas, weighted by how well the
+ * cell resolves them. A digit twelve pixels tall closes its own counters, so
+ * counting them there would decide against the right digit.
+ */
+function shapeDistance(cell, template) {
+	return chamfer(cell, template) +
+		HOLE_COST * cell.trust * Math.abs(cell.holes - template.holes);
+}
+
+/* ----------------------------------------------------------------- Templates */
 
 const FONTS = [
 	"400 96px Arial, Helvetica, sans-serif",
@@ -909,7 +912,10 @@ function classify(cell) {
 	return ranked;
 }
 
-/* ------------------------------------------------------------------ Reading */
+/* ------------------------------------------------------------------- Reading */
+
+const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
+const WARP_STILL = 80;      // pixels per cell for a single picture
 
 /** Finds the grid and straightens it, the costly half of a reading. */
 function straighten(image, cellPx) {
@@ -978,7 +984,10 @@ function readImage(image, cellPx, bias) {
 	return readCells(plane, bias || INK_BIAS);
 }
 
-/* ------------------------------------------------------------------- Repair */
+/* -------------------------------------------------------------------- Repair */
+
+const FAINT_COST = 0.15;    // what it costs to read a digit into a nearly empty cell
+const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
 
 function unique(grid) {
 	if (S.validate(grid).length > 0) return false;
@@ -1104,7 +1113,10 @@ function readPuzzle(image, cellPx) {
 	return { ok: false, reason: "grid read, but it does not solve", reading: last };
 }
 
-/* ---------------------------------------------------------------- Capture */
+/* ------------------------------------------------------------------- Capture */
+
+const LIVE_SIDE = 1024;     // frames from the camera are scaled to this
+const STILL_SIDE = 1600;    // a picked photo is scaled to this
 
 /** Draws a video frame or an image onto a canvas and returns its pixels. */
 function pixelsOf(source, width, height, maxSide) {
@@ -1129,7 +1141,11 @@ function loadImage(file) {
 	});
 }
 
-/* --------------------------------------------------------------------- UI */
+/* ------------------------------------------------------------------- Display */
+
+const AGREE_FRAMES = 3;     // live frames that must agree before accepting
+const AGREE_WINDOW = 6;     // and the span of frames they may come from
+const LIVE_PAUSE = 80;      // rest between two frames, on top of the reading itself
 
 function buildOverlay() {
 	const root = document.createElement("div");
