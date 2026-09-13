@@ -14,7 +14,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install minification tools
-        run: sudo npm install -g terser clean-css-cli
+        run: |
+          npm install -g --prefix "$RUNNER_TEMP/npm" terser lightningcss-cli
+          echo "$RUNNER_TEMP/npm/bin" >> "$GITHUB_PATH"
 
       - name: Bundle and minify JS
         run: |
@@ -35,7 +37,7 @@ jobs:
           ' index.html > index.tmp && mv index.tmp index.html
 
       - name: Minify CSS
-        run: cleancss -O2 style.css -o style.css.tmp && mv style.css.tmp style.css
+        run: lightningcss --minify style.css -o style.css.tmp && mv style.css.tmp style.css
 
       - name: Push to dist branch
         run: |
