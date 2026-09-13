@@ -16,8 +16,22 @@ jobs:
       - name: Install minification tools
         run: sudo npm install -g uglify-js uglifycss
 
-      - name: Minify JS
-        run: uglifyjs app.js -o app.js -c -m && uglifyjs camera.js -o camera.js -c -m
+      - name: Bundle and minify JS
+        run: |
+          # index.html holds the load order, so a further script needs no change here.
+          FILES=$(sed -n 's/.*<script src="\([^"]*\.js\)".*/\1/p' index.html | tr '\n' ' ')
+          test -n "$FILES" || { echo "index.html names no script"; exit 1; }
+          echo "bundling $FILES"
+          cat $FILES > bundle.src.js
+          uglifyjs bundle.src.js -o bundle.js -c -m
+          rm bundle.src.js $FILES
+          awk '
+            /<script src="[^"]*\.js"[^>]*><\/script>/ {
+              if (!seen) { sub(/src="[^"]*\.js"/, "src=\"bundle.js\""); seen = 1; print }
+              next
+            }
+            { print }
+          ' index.html > index.tmp && mv index.tmp index.html
 
       - name: Minify CSS
         run: uglifycss style.css > style.css.tmp && mv style.css.tmp style.css
@@ -27,11 +41,11 @@ jobs:
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
           SHA=$(git rev-parse --short HEAD)
-          sed -i -E "s/(href|src)=\"(app\.js|camera\.js|style\.css)\"/\\1=\"\\2?v=$SHA\"/g" index.html
+          sed -i -E "s/(href|src)=\"(bundle\.js|style\.css)\"/\\1=\"\\2?v=$SHA\"/g" index.html
           sed -i -E "s|(<span id=\"build\">)[^<]*(</span>)|\\1$SHA\\2|" index.html
           git checkout --orphan dist-new
           git rm -rf . --cached
-          git add index.html style.css app.js camera.js icons/favicon.svg icons/favicon-32.png icons/apple-touch-icon.png
+          git add index.html style.css bundle.js icons/favicon.svg icons/favicon-32.png icons/apple-touch-icon.png
           git commit -m "dist: build from $SHA"
           git push origin HEAD:dist --force
 
