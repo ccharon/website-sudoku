@@ -11,10 +11,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install minification tools
-        run: sudo npm install -g uglify-js uglifycss
+        run: sudo npm install -g terser clean-css-cli
 
       - name: Bundle and minify JS
         run: |
@@ -23,7 +23,8 @@ jobs:
           test -n "$FILES" || { echo "index.html names no script"; exit 1; }
           echo "bundling $FILES"
           cat $FILES > bundle.src.js
-          uglifyjs bundle.src.js -o bundle.js -c -m
+          # Nothing outside the bundle reads a top level name, so they may be shortened.
+          terser bundle.src.js -c passes=3 -m --toplevel -o bundle.js
           rm bundle.src.js $FILES
           awk '
             /<script src="[^"]*\.js"[^>]*><\/script>/ {
@@ -34,7 +35,7 @@ jobs:
           ' index.html > index.tmp && mv index.tmp index.html
 
       - name: Minify CSS
-        run: uglifycss style.css > style.css.tmp && mv style.css.tmp style.css
+        run: cleancss -O2 style.css -o style.css.tmp && mv style.css.tmp style.css
 
       - name: Push to dist branch
         run: |
