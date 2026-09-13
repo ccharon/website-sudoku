@@ -72,10 +72,16 @@ function isComplete(grid) {
 	return true;
 }
 
+const UNIT_ROW = 0;
+const UNIT_COLUMN = 1;
+const UNIT_BOX = 2;
 const UNIT_NAMES = ["row", "column", "box"];
 
 /** Marks a cell whose value is not a digit from 1 to 9. */
 const UNIT_VALUE = -1;
+
+/* A digit indexes its slot directly, so slot 0 of every unit stays unused. */
+const DIGIT_SLOTS = SIZE + 1;
 
 /**
  * Reports every cell outside the digit range and every unit that holds a digit
@@ -83,9 +89,9 @@ const UNIT_VALUE = -1;
  * column, box.
  */
 function validate(grid) {
-	const rowFirst = new Int32Array(SIZE * (SIZE + 1)).fill(-1);
-	const colFirst = new Int32Array(SIZE * (SIZE + 1)).fill(-1);
-	const boxFirst = new Int32Array(SIZE * (SIZE + 1)).fill(-1);
+	const rowFirst = new Int32Array(SIZE * DIGIT_SLOTS).fill(-1);
+	const colFirst = new Int32Array(SIZE * DIGIT_SLOTS).fill(-1);
+	const boxFirst = new Int32Array(SIZE * DIGIT_SLOTS).fill(-1);
 	const conflicts = [];
 
 	for (let i = 0; i < CELLS; i++) {
@@ -101,21 +107,21 @@ function validate(grid) {
 			continue;
 		}
 		const box = boxOf(row, col);
-		const ri = row * (SIZE + 1) + value;
-		const ci = col * (SIZE + 1) + value;
-		const bi = box * (SIZE + 1) + value;
+		const ri = row * DIGIT_SLOTS + value;
+		const ci = col * DIGIT_SLOTS + value;
+		const bi = box * DIGIT_SLOTS + value;
 
 		let other = -1;
-		let unit = 0;
+		let unit = UNIT_ROW;
 		if (rowFirst[ri] >= 0) {
 			other = rowFirst[ri];
-			unit = 0;
+			unit = UNIT_ROW;
 		} else if (colFirst[ci] >= 0) {
 			other = colFirst[ci];
-			unit = 1;
+			unit = UNIT_COLUMN;
 		} else if (boxFirst[bi] >= 0) {
 			other = boxFirst[bi];
-			unit = 2;
+			unit = UNIT_BOX;
 		}
 		if (other >= 0) {
 			conflicts.push({
@@ -140,6 +146,12 @@ function conflictText(c) {
 		`r${c.otherRow + 1}c${c.otherCol + 1}, r${c.row + 1}c${c.col + 1}`;
 }
 
+/** The first conflict in words, with a count of the others. */
+function conflictSummary(conflicts) {
+	const more = conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : "";
+	return conflictText(conflicts[0]) + more;
+}
+
 /* ------------------------------------------------------------- Exact Cover */
 
 /*
@@ -162,9 +174,18 @@ function rowIndex(row, col, digit) {
 	return (row * SIZE + col) * SIZE + digit;
 }
 
+/* A candidate packs the cell and the digit, the digit in the lower place. */
+function cellOfCandidate(candidate) {
+	return Math.floor(candidate / SIZE);
+}
+
+function digitOfCandidate(candidate) {
+	return candidate % SIZE;
+}
+
 function colsOfRow(candidate) {
-	const digit = candidate % SIZE;
-	const cell = Math.floor(candidate / SIZE);
+	const digit = digitOfCandidate(candidate);
+	const cell = cellOfCandidate(candidate);
 	const row = Math.floor(cell / SIZE);
 	const col = cell % SIZE;
 	return [
@@ -380,6 +401,7 @@ function run(grid, onSolution, random) {
 			applied++;
 		}
 		search(m, onSolution);
+		// search leaves the solution as it found it, so the givens lie on top.
 		while (applied-- > 0) {
 			unselectRow(m, m.sol[m.solLen - 1]);
 		}
@@ -394,10 +416,7 @@ function run(grid, onSolution, random) {
 function gridFromRows(sol, len) {
 	const grid = emptyGrid();
 	for (let k = 0; k < len; k++) {
-		const candidate = sol[k];
-		const digit = candidate % SIZE;
-		const cell = Math.floor(candidate / SIZE);
-		grid[cell] = digit + 1;
+		grid[cellOfCandidate(sol[k])] = digitOfCandidate(sol[k]) + 1;
 	}
 	return grid;
 }
@@ -500,6 +519,9 @@ globalThis.Sudoku = {
 
 /* ----------------------------------------------------------------- Display */
 
+const SEED_BOUND = 0x100000000;    // seeds are the 32 bit numbers below this
+const CLEAR_ASK_MS = 4000;         // a warned bin stays armed this long
+
 function initUI() {
 	const boardEl = document.getElementById("board");
 	const statusEl = document.getElementById("status");
@@ -542,8 +564,7 @@ function initUI() {
 			cells[i].value = grid[i] === 0 ? "" : String(grid[i]);
 			cells[i].classList.toggle("given", grid[i] !== 0 && given[i] === 1);
 			cells[i].classList.toggle("filled", Boolean(filled) && grid[i] !== 0 && given[i] === 0);
-			cells[i].classList.remove("conflict");
-			cells[i].classList.remove("uncertain");
+			cells[i].classList.remove("conflict", "uncertain");
 		}
 	}
 
@@ -566,8 +587,22 @@ function initUI() {
 		}
 	}
 
+	/** Takes what stands on the board as the puzzle and checks it over. */
+	function readBoard() {
+		const grid = readGrid();
+		takeAsGiven(grid);
+		return { grid: grid, conflicts: validate(grid) };
+	}
+
+	/** Puts the reading back on the board and points at the first conflict. */
+	function showConflicts(grid, conflicts) {
+		showGrid(grid, false);
+		markConflicts(conflicts);
+		setStatus(conflictSummary(conflicts), true);
+	}
+
 	function handleGenerate() {
-		const seed = (Math.random() * 0x100000000) >>> 0;
+		const seed = (Math.random() * SEED_BOUND) >>> 0;
 		const started = performance.now();
 		const grid = generate(seed, true);
 		const elapsed = performance.now() - started;
@@ -578,47 +613,36 @@ function initUI() {
 	}
 
 	function handleCheck() {
-		const grid = readGrid();
-		takeAsGiven(grid);
-		showGrid(grid, false);
-
-		const conflicts = validate(grid);
-		if (conflicts.length > 0) {
-			markConflicts(conflicts);
-			const more = conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : "";
-			setStatus(conflictText(conflicts[0]) + more, true);
+		const board = readBoard();
+		if (board.conflicts.length > 0) {
+			showConflicts(board.grid, board.conflicts);
 			return;
 		}
+		showGrid(board.grid, false);
 
-		const count = countSolutions(grid, 2);
+		const count = countSolutions(board.grid, 2);
 		if (count === 0) {
 			setStatus("No conflicts, but no solution.", true);
 		} else if (count === 1) {
-			setStatus(`${givens(grid)} givens, one solution.`, false);
+			setStatus(`${givens(board.grid)} givens, one solution.`, false);
 		} else {
-			setStatus(`${givens(grid)} givens, several solutions.`, false);
+			setStatus(`${givens(board.grid)} givens, several solutions.`, false);
 		}
 	}
 
 	function handleSolve() {
-		const grid = readGrid();
-		takeAsGiven(grid);
-
-		const conflicts = validate(grid);
-		if (conflicts.length > 0) {
-			showGrid(grid, false);
-			markConflicts(conflicts);
-			const more = conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : "";
-			setStatus(conflictText(conflicts[0]) + more, true);
+		const board = readBoard();
+		if (board.conflicts.length > 0) {
+			showConflicts(board.grid, board.conflicts);
 			return;
 		}
 
 		const started = performance.now();
-		const solution = solve(grid, null);
+		const solution = solve(board.grid, null);
 		const elapsed = performance.now() - started;
 
 		if (solution === null) {
-			showGrid(grid, false);
+			showGrid(board.grid, false);
 			setStatus("No solution.", true);
 			return;
 		}
@@ -631,7 +655,7 @@ function initUI() {
 
 	function handleClear() {
 		const now = Date.now();
-		if (now - clearAsked > 4000 && givens(readGrid()) > 0) {
+		if (now - clearAsked > CLEAR_ASK_MS && givens(readGrid()) > 0) {
 			clearAsked = now;
 			setStatus("Press the bin again to clear the board.", false);
 			return;
@@ -646,11 +670,9 @@ function initUI() {
 		const i = cells.indexOf(event.target);
 		if (i < 0) return;
 		event.target.value = event.target.value.replace(/[^1-9]/g, "").slice(-1);
-		event.target.classList.remove("conflict");
-		event.target.classList.remove("uncertain");
+		event.target.classList.remove("conflict", "uncertain", "filled");
 		given[i] = event.target.value === "" ? 0 : 1;
 		event.target.classList.toggle("given", given[i] === 1);
-		event.target.classList.remove("filled");
 		if (event.target.value !== "" && i + 1 < CELLS) {
 			cells[i + 1].focus();
 		}
@@ -697,8 +719,7 @@ function initUI() {
 				showGrid(grid, false);
 				markConflicts(conflicts);
 				if (uncertain) markUncertain(uncertain);
-				const more = conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : "";
-				return { solutions: 0, conflict: conflictText(conflicts[0]) + more };
+				return { solutions: 0, conflict: conflictSummary(conflicts) };
 			}
 			const count = countSolutions(grid, 2);
 			const solution = maySolve && count === 1 ? solve(grid, null) : null;

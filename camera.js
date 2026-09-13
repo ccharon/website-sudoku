@@ -149,7 +149,52 @@ function components(mask, w, h) {
 	return { labels: labels, boxes: boxes };
 }
 
+/**
+ * Marks the pixels that sit in a run of at least the given length, along the
+ * rows and down the columns. A grid line reaches that far, a digit stroke and
+ * a speck of dirt do not.
+ */
+function longRuns(mask, w, h, needX, needY) {
+	const out = new Uint8Array(w * h);
+	for (let y = 0; y < h; y++) {
+		let run = 0;
+		for (let x = 0; x <= w; x++) {
+			if (x < w && mask[y * w + x] === 1) { run++; continue; }
+			if (run >= needX) for (let k = x - run; k < x; k++) out[y * w + k] = 1;
+			run = 0;
+		}
+	}
+	for (let x = 0; x < w; x++) {
+		let run = 0;
+		for (let y = 0; y <= h; y++) {
+			if (y < h && mask[y * w + x] === 1) { run++; continue; }
+			if (run >= needY) for (let k = y - run; k < y; k++) out[k * w + x] = 1;
+			run = 0;
+		}
+	}
+	return out;
+}
+
+/** Copies one labelled patch out of a label plane as a mask of its own. */
+function patchMask(labels, w, box) {
+	const bw = boxWidth(box);
+	const bh = boxHeight(box);
+	const out = new Uint8Array(bw * bh);
+	for (let y = 0; y < bh; y++) {
+		for (let x = 0; x < bw; x++) {
+			out[y * bw + x] = labels[(box.y0 + y) * w + box.x0 + x] === box.id ? 1 : 0;
+		}
+	}
+	return out;
+}
+
 /* ------------------------------------------------------------------ Geometry */
+
+const BEND_START = 0.5;     // pixels a hull point must stand out to be kept
+const BEND_LIMIT = 1e4;     // past this the hull does not thin out any further
+const SIDE_ENDS = 0.08;     // a point this near either end belongs to no single side
+const MIN_SIDE = 8;         // pixels, a shorter side is not a photographed grid
+const SIDE_RATIO = 2.5;     // longest side over shortest, above this it is not one
 
 function median(values) {
 	const sorted = values.slice().sort(function (a, b) { return a - b; });
@@ -182,7 +227,7 @@ function convexHull(points) {
 /** Drops hull points that barely bend, down to at most limit of them. */
 function simplifyHull(hull, limit) {
 	let out = hull;
-	let tolerance = 0.5;
+	let tolerance = BEND_START;
 	while (out.length > limit) {
 		const kept = [];
 		for (let i = 0; i < out.length; i++) {
@@ -195,7 +240,7 @@ function simplifyHull(hull, limit) {
 		}
 		if (kept.length < 4 || kept.length === out.length) {
 			tolerance *= 2;
-			if (tolerance > 1e4) break;
+			if (tolerance > BEND_LIMIT) break;
 			continue;
 		}
 		out = kept;
@@ -239,7 +284,7 @@ function distanceToSide(p, a, b) {
 	const vy = b[1] - a[1];
 	const len = vx * vx + vy * vy;
 	const t = len === 0 ? 0 : ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / len;
-	if (t < 0.08 || t > 0.92) return Infinity;    // corners belong to two sides
+	if (t < SIDE_ENDS || t > 1 - SIDE_ENDS) return Infinity;    // corners belong to two sides
 	return Math.abs((p[0] - a[0]) * vy - (p[1] - a[1]) * vx) / Math.sqrt(len);
 }
 
@@ -299,7 +344,7 @@ function sideLengths(quad) {
 function plausibleQuad(quad) {
 	const sides = sideLengths(quad);
 	const shortest = Math.min(...sides);
-	return shortest > 8 && Math.max(...sides) / shortest < 2.5;
+	return shortest > MIN_SIDE && Math.max(...sides) / shortest < SIDE_RATIO;
 }
 
 /** Mean side length of the quadrilateral, in pixels of the photo. */
@@ -367,6 +412,15 @@ function rectQuad(rect) {
 /* ---------------------------------------------------------------- Grid lines */
 
 const LINE_GAP = 0.03;      // share of the image a line may be broken for, dotted rules included
+const LINE_COVER = 0.6;     // share of the way across a line has to reach to count
+const LINE_THICK = 0.04;    // a band wider than this share of the image is not one line
+const MIN_BANDS = 8;        // lines a direction must show before it is rated at all
+const CELLS_OFF = 2;        // how far the counted cells may differ from nine
+const DRIFT_COST = 4;       // weight of uneven spacing against the rating
+const OFF_SIZE = 0.6;       // what a grid that is not nine cells wide still scores
+const BOUND_KEEP = 0.5;     // share of the image a cut has to leave standing
+const BOUND_EDGE = 0.02;    // a bound this close to the edge has cut nothing off
+const MIN_CUT_BANDS = 4;    // lines needed before the inner extent means anything
 
 /**
  * Index steps of one direction: from one band to the next, and from one pixel
@@ -381,19 +435,22 @@ function lineBands(ink, size, along) {
 	const { band, walk } = lineSteps(size, along);
 	const bands = [];
 	let start = -1;
-	for (let i = 0; i < size; i++) {
-		let count = 0;
-		for (let k = 0; k < size; k++) {
-			count += ink[i * band + k * walk];
+	// The step past the end closes a band that runs into the edge.
+	for (let i = 0; i <= size; i++) {
+		let isLine = false;
+		if (i < size) {
+			let count = 0;
+			for (let k = 0; k < size; k++) {
+				count += ink[i * band + k * walk];
+			}
+			isLine = count >= size * LINE_COVER;
 		}
-		const isLine = count >= size * 0.6;
 		if (isLine && start < 0) start = i;
 		if (!isLine && start >= 0) {
-			if (i - start <= size * 0.04) bands.push((start + i - 1) / 2);
+			if (i - start <= size * LINE_THICK) bands.push((start + i - 1) / 2);
 			start = -1;
 		}
 	}
-	if (start >= 0 && size - start <= size * 0.04) bands.push((start + size - 1) / 2);
 	return bands;
 }
 
@@ -461,18 +518,19 @@ function bandScore(ink, size) {
 	let score = 1;
 	for (const along of [true, false]) {
 		const bands = lineBands(ink, size, along);
-		if (bands.length < 8) return 0;
+		if (bands.length < MIN_BANDS) return 0;
 		const steps = [];
 		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
 		const step = median(steps);
 		if (!(step > 0)) return 0;
 		const reach = bands[bands.length - 1] - bands[0];
 		const cells = Math.round(reach / step);
-		if (cells < 7 || cells > 11) return 0;
+		if (Math.abs(cells - S.SIZE) > CELLS_OFF) return 0;
 		let drift = 0;
 		for (const d of steps) drift += Math.abs(d - step);
 		drift /= steps.length * step;
-		score *= Math.max(0, 1 - 4 * drift) * (reach / size) * (cells === S.SIZE ? 1 : 0.6);
+		score *= Math.max(0, 1 - DRIFT_COST * drift) * (reach / size) *
+			(cells === S.SIZE ? 1 : OFF_SIZE);
 	}
 	return score;
 }
@@ -487,15 +545,15 @@ function gridBounds(ink, size) {
 	const box = { x0: 0, y0: 0, x1: size, y1: size };
 	for (const along of [true, false]) {
 		const bands = lineBands(ink, size, along);
-		if (bands.length < 4) return null;
+		if (bands.length < MIN_CUT_BANDS) return null;
 		const span = innerExtent(ink, size, bands, along);
 		if (span === null) return null;
 		if (along) { box.y0 = span[0]; box.y1 = span[1]; }
 		else { box.x0 = span[0]; box.x1 = span[1]; }
 	}
-	if (box.x1 - box.x0 < size * 0.5 || box.y1 - box.y0 < size * 0.5) return null;
-	const trimmed = box.x0 > size * 0.02 || box.y0 > size * 0.02 ||
-		box.x1 < size * 0.98 || box.y1 < size * 0.98;
+	if (box.x1 - box.x0 < size * BOUND_KEEP || box.y1 - box.y0 < size * BOUND_KEEP) return null;
+	const trimmed = box.x0 > size * BOUND_EDGE || box.y0 > size * BOUND_EDGE ||
+		box.x1 < size * (1 - BOUND_EDGE) || box.y1 < size * (1 - BOUND_EDGE);
 	return trimmed ? box : null;
 }
 
@@ -505,6 +563,16 @@ const CANDIDATES = 6;       // ink patches examined before settling on one
 const SCORE_CELL = 32;      // cell size of the cheap pass that rates a candidate
 const WEAK_GRID = 0.02;     // below this the patch is tried again without its attachments
 const RUN_SHARE = 0.3;      // share of the patch a run must span to pass as a line
+const GOOD_ENOUGH = 0.8;    // a candidate this convincing ends the search
+const FIT_PASSES = 2;       // how often the sides are fitted and the corners taken anew
+const SIDE_BAND = 0.06;     // share of a side length a point may lie off it
+const SIDE_POINTS = 12;     // points a side needs before a line is fitted to it
+const MIN_OUTLINE = 8;      // points an outline needs to shape a quadrilateral
+const HULL_KEEP = 48;       // hull points left for the search over quadrilaterals
+const PATCH_AREA = 0.02;    // share of the image a patch must cover to be a candidate
+const PATCH_RATIO = 2;      // width over height, and the same the other way round
+const FILL_MIN = 0.02;      // below this the patch is too sparse to be an outline
+const FILL_MAX = 0.6;       // above it the patch is a solid area, not an outline
 
 /**
  * Fits a line to each of the four sides and intersects them. A thin or blurred
@@ -513,8 +581,8 @@ const RUN_SHARE = 0.3;      // share of the patch a run must span to pass as a l
  */
 function refineQuad(quad, points) {
 	let current = quad;
-	for (let pass = 0; pass < 2; pass++) {
-		const near = sideOf(current) * 0.06;
+	for (let pass = 0; pass < FIT_PASSES; pass++) {
+		const near = sideOf(current) * SIDE_BAND;
 		const sides = [[], [], [], []];
 		for (const p of points) {
 			let at = -1;
@@ -527,7 +595,7 @@ function refineQuad(quad, points) {
 		}
 		const lines = [];
 		for (const side of sides) {
-			if (side.length < 12) return current;
+			if (side.length < SIDE_POINTS) return current;
 			lines.push(fitLine(side));
 		}
 		const next = [];
@@ -575,8 +643,8 @@ function outlinePoints(labels, w, box) {
 
 /** Hull, largest quadrilateral, then the sides fitted to the points again. */
 function quadFromPoints(points) {
-	if (points.length < 8) return null;
-	const corners = maxAreaQuad(simplifyHull(convexHull(points), 48));
+	if (points.length < MIN_OUTLINE) return null;
+	const corners = maxAreaQuad(simplifyHull(convexHull(points), HULL_KEEP));
 	if (corners === null) return null;
 	const quad = orderQuad(refineQuad(orderQuad(corners), points));
 	return plausibleQuad(quad) ? quad : null;
@@ -596,24 +664,7 @@ function latticePoints(labels, w, box) {
 	const bw = boxWidth(box);
 	const bh = boxHeight(box);
 	const need = Math.round(Math.max(bw, bh) * RUN_SHARE);
-	const keep = new Uint8Array(bw * bh);
-
-	for (let y = 0; y < bh; y++) {
-		let run = 0;
-		for (let x = 0; x <= bw; x++) {
-			if (x < bw && labels[(box.y0 + y) * w + box.x0 + x] === box.id) { run++; continue; }
-			if (run >= need) for (let k = x - run; k < x; k++) keep[y * bw + k] = 1;
-			run = 0;
-		}
-	}
-	for (let x = 0; x < bw; x++) {
-		let run = 0;
-		for (let y = 0; y <= bh; y++) {
-			if (y < bh && labels[(box.y0 + y) * w + box.x0 + x] === box.id) { run++; continue; }
-			if (run >= need) for (let k = y - run; k < y; k++) keep[k * bw + x] = 1;
-			run = 0;
-		}
-	}
+	const keep = longRuns(patchMask(labels, w, box), bw, bh, need, need);
 
 	const points = outlinePoints(keep, bw, { id: 1, x0: 0, y0: 0, x1: bw - 1, y1: bh - 1 });
 	for (const p of points) { p[0] += box.x0; p[1] += box.y0; }
@@ -621,7 +672,7 @@ function latticePoints(labels, w, box) {
 }
 
 function gridLikeness(gray, w, h, quad) {
-	const probe = SCORE_CELL * 9;
+	const probe = SCORE_CELL * S.SIZE;
 	return bandScore(threshold(rectify(gray, w, h, quad, probe), probe, probe,
 		Math.round(SCORE_CELL / 2), INK_BIAS), probe);
 }
@@ -633,16 +684,16 @@ function gridLikeness(gray, w, h, quad) {
  */
 function findGrid(gray, ink, w, h) {
 	const found = components(ink, w, h);
-	const minArea = w * h * 0.02;
+	const minArea = w * h * PATCH_AREA;
 	const candidates = [];
 	for (const box of found.boxes) {
 		const bw = boxWidth(box);
 		const bh = boxHeight(box);
 		const area = bw * bh;
 		if (area < minArea) continue;
-		if (bw / bh < 0.5 || bw / bh > 2) continue;
+		if (bw / bh < 1 / PATCH_RATIO || bw / bh > PATCH_RATIO) continue;
 		const fill = box.count / area;
-		if (fill < 0.02 || fill > 0.6) continue;
+		if (fill < FILL_MIN || fill > FILL_MAX) continue;
 		candidates.push({ box: box, area: area });
 	}
 	candidates.sort(function (a, b) { return b.area - a.area; });
@@ -655,7 +706,7 @@ function findGrid(gray, ink, w, h) {
 		if (best === null || score > best.score) {
 			best = { quad: quad, score: score, box: candidate.box };
 		}
-		if (score > 0.8) break;
+		if (score > GOOD_ENOUGH) break;
 	}
 	if (best === null) return null;
 
@@ -672,32 +723,25 @@ function findGrid(gray, ink, w, h) {
 const CELL_INSET = 0.14;    // share of a cell dropped on each side
 const CELL_OFF = 0.36;      // how far off centre a digit may sit inside a cell
 const CELL_SPAN = 0.92;     // a run reaching this far across a cell is a grid line
+const CELL_FLAT = 0.22;     // shorter than this share of a cell it is a piece of a line
+const SPECK = 5;            // pixels, less than that is threshold noise
+const INK_ANY = 0.006;      // share of the cell below which it counts as empty
+const INK_FAINT = 0.02;     // and below which the digit is not to be relied on
+const FAINT_PIXELS = 10;    // as is a digit drawn from fewer pixels than this
+const FAINT_TALL = 0.3;     // or one shorter than this share of the cell
 const NORM = 32;            // side of a normalised digit bitmap
 const NORM_FIT = 24;        // the digit is scaled to fit this box
+const NORM_COVER = 0.4;     // ink a shrunken pixel needs before it is set
 
 /**
  * Clears the runs that cross the whole cell. Only a grid line reaches that far,
  * and a thick one touches the digit, which would then be dropped along with it.
  */
 function stripSpans(mask, w, h) {
+	const lines = longRuns(mask, w, h, Math.round(w * CELL_SPAN), Math.round(h * CELL_SPAN));
 	const out = mask.slice();
-	const acrossW = Math.round(w * CELL_SPAN);
-	const acrossH = Math.round(h * CELL_SPAN);
-	for (let y = 0; y < h; y++) {
-		let run = 0;
-		for (let x = 0; x <= w; x++) {
-			if (x < w && mask[y * w + x] === 1) { run++; continue; }
-			if (run >= acrossW) for (let k = x - run; k < x; k++) out[y * w + k] = 0;
-			run = 0;
-		}
-	}
-	for (let x = 0; x < w; x++) {
-		let run = 0;
-		for (let y = 0; y <= h; y++) {
-			if (y < h && mask[y * w + x] === 1) { run++; continue; }
-			if (run >= acrossH) for (let k = y - run; k < y; k++) out[k * w + x] = 0;
-			run = 0;
-		}
+	for (let i = 0; i < out.length; i++) {
+		if (lines[i] === 1) out[i] = 0;
 	}
 	return out;
 }
@@ -728,7 +772,7 @@ function normalise(bitmap, w, box) {
 					total++;
 				}
 			}
-			if (on / total >= 0.4) {
+			if (on / total >= NORM_COVER) {
 				small[y * tw + x] = 1;
 				cx += x; cy += y; count++;
 			}
@@ -754,17 +798,17 @@ function isolateDigit(ink, thin, size, rect, sourceScale) {
 	const sub = stripSpans(copyRect(ink, size, rect.x0, rect.y0, w, h), w, h);
 	let marked = 0;
 	for (let i = 0; i < sub.length; i++) marked += sub[i];
-	if (marked < w * h * 0.006) return null;
+	if (marked < w * h * INK_ANY) return null;
 
 	const found = components(sub, w, h);
 	let best = null;
 	for (const box of found.boxes) {
 		const bw = boxWidth(box);
 		const bh = boxHeight(box);
-		if (box.count < 5) continue;
-		if (bh < h * 0.22) continue;     // flat leftovers are grid lines
-		if (bw > w * 0.92) continue;     // a run across the cell is a line
-		if (bh > h * 0.92) continue;     // and so is one down the whole of it
+		if (box.count < SPECK) continue;
+		if (bh < h * CELL_FLAT) continue;     // flat leftovers are grid lines
+		if (bw > w * CELL_SPAN) continue;     // a run across the cell is a line
+		if (bh > h * CELL_SPAN) continue;     // and so is one down the whole of it
 		// A digit sits in the middle, a piece of a dotted rule sits at the edge.
 		if (Math.abs((box.x0 + box.x1) / 2 - w / 2) > w * CELL_OFF) continue;
 		if (Math.abs((box.y0 + box.y1) / 2 - h / 2) > h * CELL_OFF) continue;
@@ -773,7 +817,8 @@ function isolateDigit(ink, thin, size, rect, sourceScale) {
 	if (best === null) return null;
 
 	// Too little of it to call a digit. Kept so the solver can still ask.
-	const faint = marked < w * h * 0.02 || best.count < 10 || boxHeight(best) < h * 0.3;
+	const faint = marked < w * h * INK_FAINT || best.count < FAINT_PIXELS ||
+		boxHeight(best) < h * FAINT_TALL;
 
 	const digit = new Uint8Array(w * h);
 	for (let p = 0; p < w * h; p++) digit[p] = found.labels[p] === best.id ? 1 : 0;
@@ -810,11 +855,11 @@ function isolateDigit(ink, thin, size, rect, sourceScale) {
  * dropped so the grid lines fall away.
  */
 function cutCells(ink, thin, size, sourceScale) {
-	const cell = size / 9;
+	const cell = size / S.SIZE;
 	const inset = Math.round(cell * CELL_INSET);
 	const out = [];
-	for (let r = 0; r < 9; r++) {
-		for (let c = 0; c < 9; c++) {
+	for (let r = 0; r < S.SIZE; r++) {
+		for (let c = 0; c < S.SIZE; c++) {
 			out.push(isolateDigit(ink, thin, size, {
 				x0: Math.round(c * cell) + inset,
 				y0: Math.round(r * cell) + inset,
@@ -830,6 +875,8 @@ function cutCells(ink, thin, size, sourceScale) {
 
 const HOLE_COST = 0.2;      // penalty per enclosed area two shapes differ by
 const HOLE_SURE = 32;       // digit height in source pixels for a fully trusted count
+const HOLE_SHARE = 0.004;   // share of the digit a counter must cover to be one
+const HOLE_FLOOR = 2;       // and never fewer pixels than this
 
 /**
  * Carries the distance of the already visited row and neighbour into every
@@ -868,7 +915,7 @@ function distanceMap(bitmap) {
 
 /** A counter smaller than this share of the digit is threshold noise. */
 function minHole(box) {
-	return Math.max(2, Math.round(boxWidth(box) * boxHeight(box) * 0.004));
+	return Math.max(HOLE_FLOOR, Math.round(boxWidth(box) * boxHeight(box) * HOLE_SHARE));
 }
 
 /**
@@ -983,7 +1030,7 @@ function buildTemplates() {
 	const seen = new Set();
 
 	for (const font of FONTS) {
-		for (let digit = 1; digit <= 9; digit++) {
+		for (let digit = 1; digit <= S.SIZE; digit++) {
 			ctx.fillStyle = "#fff";
 			ctx.fillRect(0, 0, side, side);
 			ctx.fillStyle = "#000";
@@ -1026,7 +1073,7 @@ function classify(cell) {
 		if (score < best[template.digit]) best[template.digit] = score;
 	}
 	const ranked = [];
-	for (let d = 1; d <= 9; d++) ranked.push({ digit: d, score: best[d] });
+	for (let d = 1; d <= S.SIZE; d++) ranked.push({ digit: d, score: best[d] });
 	ranked.sort(function (a, b) { return a.score - b.score; });
 	return ranked;
 }
@@ -1037,6 +1084,8 @@ const WARP_LIVE = 64;       // pixels per cell when reading the camera stream
 const WARP_STILL = 80;      // pixels per cell for a single picture
 const CUT_GAIN = 0.05;      // how much more regular the lines must get for a cut to count
 const CUT_SURE = 0.5;       // line score a cut must reach when the uncut grid scored nothing
+const FIND_CELLS = 24;      // the outline pass assumes a photo about this many cells wide
+const FIND_RADIUS = 4;      // and never averages over fewer pixels than this
 
 /** The ink mask of a straightened grid at one threshold. */
 function inkOf(plane, bias) {
@@ -1047,13 +1096,14 @@ function inkOf(plane, bias) {
 function straighten(gray, w, h, cellPx) {
 	if (templates === null) templates = buildTemplates();
 
-	const ink = threshold(gray, w, h, Math.max(4, Math.round(Math.min(w, h) / 24)), INK_FIND);
+	const radius = Math.max(FIND_RADIUS, Math.round(Math.min(w, h) / FIND_CELLS));
+	const ink = threshold(gray, w, h, radius, INK_FIND);
 
 	const quad = findGrid(gray, ink, w, h);
 	if (quad === null) return null;
 
 	const cell = cellPx || WARP_STILL;
-	const size = cell * 9;
+	const size = cell * S.SIZE;
 	const plane = {
 		flat: rectify(gray, w, h, quad, size),
 		size: size,
@@ -1122,6 +1172,8 @@ const FAINT_COST = 0.15;    // what it costs to read a digit into a nearly empty
 const SURE_MARGIN = 0.12;   // below this a cell is shown as unconfirmed
 const SINGLE_TRIES = 16;    // doubtful cells offered to the search, one at a time
 const PAIR_TRIES = 10;      // and to the search over two of them
+const FAINT_CHOICES = 2;    // digits a nearly empty cell offers besides staying empty
+const SURE_CHOICES = 3;     // digits a cell with ink offers, the read one first
 
 function unique(grid) {
 	if (S.validate(grid).length > 0) return false;
@@ -1141,14 +1193,14 @@ function doubtfulCells(reading) {
 		const options = [];
 		if (reading.faint[i] === 1) {
 			options.push({ digit: 0, cost: 0 });
-			for (let k = 0; k < 2; k++) {
+			for (let k = 0; k < FAINT_CHOICES; k++) {
 				options.push({
 					digit: ranked[k].digit,
 					cost: FAINT_COST + ranked[k].score - ranked[0].score
 				});
 			}
 		} else {
-			for (let k = 0; k < 3; k++) {
+			for (let k = 0; k < SURE_CHOICES; k++) {
 				options.push({ digit: ranked[k].digit, cost: ranked[k].score - ranked[0].score });
 			}
 		}
@@ -1426,6 +1478,15 @@ function initPhoto() {
 			read.solutions !== 1);
 	}
 
+	/* One frame the reader chokes on must not put the viewfinder out. */
+	function readSafely(frame, turned) {
+		try {
+			return readFrame(frame, WARP_LIVE, turned);
+		} catch (error) {
+			return { ok: false, reason: error.message };
+		}
+	}
+
 	function tick() {
 		timer = 0;
 		if (stream === null || video.videoWidth === 0) {
@@ -1440,7 +1501,7 @@ function initPhoto() {
 		 */
 		const probe = (frames++ % PROBE_EVERY) === PROBE_EVERY - 1;
 		const turned = probe ? !dark : dark;
-		const result = readFrame(frame, WARP_LIVE, turned);
+		const result = readSafely(frame, turned);
 		if (result.ok) dark = turned;
 		// An empty probe says nothing about the polarity in use, so it is dropped.
 		if (probe && !result.ok) {
@@ -1508,7 +1569,7 @@ function initPhoto() {
 				hint.textContent = capitalise(result.reason) + ". Try another photo.";
 			}
 		} catch (error) {
-			hint.textContent = "That file is not an image.";
+			hint.textContent = "Could not read that photo: " + error.message;
 		}
 		file.value = "";
 	});
