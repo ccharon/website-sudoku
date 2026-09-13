@@ -671,8 +671,36 @@ function findGrid(gray, ink, w, h) {
 
 const CELL_INSET = 0.14;    // share of a cell dropped on each side
 const CELL_OFF = 0.36;      // how far off centre a digit may sit inside a cell
+const CELL_SPAN = 0.92;     // a run reaching this far across a cell is a grid line
 const NORM = 32;            // side of a normalised digit bitmap
 const NORM_FIT = 24;        // the digit is scaled to fit this box
+
+/**
+ * Clears the runs that cross the whole cell. Only a grid line reaches that far,
+ * and a thick one touches the digit, which would then be dropped along with it.
+ */
+function stripSpans(mask, w, h) {
+	const out = mask.slice();
+	const acrossW = Math.round(w * CELL_SPAN);
+	const acrossH = Math.round(h * CELL_SPAN);
+	for (let y = 0; y < h; y++) {
+		let run = 0;
+		for (let x = 0; x <= w; x++) {
+			if (x < w && mask[y * w + x] === 1) { run++; continue; }
+			if (run >= acrossW) for (let k = x - run; k < x; k++) out[y * w + k] = 0;
+			run = 0;
+		}
+	}
+	for (let x = 0; x < w; x++) {
+		let run = 0;
+		for (let y = 0; y <= h; y++) {
+			if (y < h && mask[y * w + x] === 1) { run++; continue; }
+			if (run >= acrossH) for (let k = y - run; k < y; k++) out[k * w + x] = 0;
+			run = 0;
+		}
+	}
+	return out;
+}
 
 /**
  * Scales the digit to a fixed box and centres it by its centre of mass, so
@@ -723,7 +751,7 @@ function normalise(bitmap, w, box) {
 function isolateDigit(ink, thin, size, rect, sourceScale) {
 	const w = rect.x1 - rect.x0;
 	const h = rect.y1 - rect.y0;
-	const sub = copyRect(ink, size, rect.x0, rect.y0, w, h);
+	const sub = stripSpans(copyRect(ink, size, rect.x0, rect.y0, w, h), w, h);
 	let marked = 0;
 	for (let i = 0; i < sub.length; i++) marked += sub[i];
 	if (marked < w * h * 0.006) return null;
