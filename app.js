@@ -685,12 +685,12 @@ function initUI() {
 	globalThis.Sudoku.ui = {
 		setStatus: setStatus,
 		/**
-		 * Takes a reading as the givens and solves it right away when it is free
-		 * of conflicts and has exactly one solution. Returns the first conflict
-		 * in the wording the buttons use, else the number of solutions counted
-		 * to two, so the caller can say what became of the reading.
+		 * Takes a reading as the givens. With maySolve set, a reading free of
+		 * conflicts and with one solution is solved at once. Returns the first
+		 * conflict in the wording the buttons use, else the number of solutions
+		 * counted to two, so the caller can say what became of the reading.
 		 */
-		setPuzzle: function (grid, uncertain) {
+		setPuzzle: function (grid, uncertain, maySolve) {
 			takeAsGiven(grid);
 			const conflicts = validate(grid);
 			if (conflicts.length > 0) {
@@ -701,7 +701,7 @@ function initUI() {
 				return { solutions: 0, conflict: conflictText(conflicts[0]) + more };
 			}
 			const count = countSolutions(grid, 2);
-			const solution = count === 1 ? solve(grid, null) : null;
+			const solution = maySolve && count === 1 ? solve(grid, null) : null;
 			showGrid(solution === null ? grid : solution, solution !== null);
 			if (uncertain) markUncertain(uncertain);
 			return { solutions: count, conflict: null };

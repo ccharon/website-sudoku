@@ -1405,7 +1405,13 @@ function initPhoto() {
 			say("The board is not ready. Reload the page.", true);
 			return;
 		}
-		const read = S.ui.setPuzzle(result.grid, result.uncertain);
+		/*
+		 * A reading the solver had to mend contradicted itself, and the mending
+		 * is a guess. Such a puzzle is shown but not solved, so the guess stays
+		 * visible instead of disappearing into a solution.
+		 */
+		const mended = result.changed.length > 0;
+		const read = S.ui.setPuzzle(result.grid, result.uncertain, !mended);
 		if (read.conflict !== null) {
 			say(read.conflict, true);
 			return;
@@ -1413,8 +1419,9 @@ function initPhoto() {
 		const open = result.uncertain.reduce(function (n, v) { return n + v; }, 0);
 		const checked = open === 0 ? "" :
 			` Check the ${open} marked cell${open === 1 ? "" : "s"}.`;
-		const outcome = read.solutions === 1 ? "and solved" :
-			read.solutions === 0 ? "but it has no solution" : "but it has several solutions";
+		const outcome = read.solutions !== 1
+			? (read.solutions === 0 ? "but it has no solution" : "but it has several solutions")
+			: (mended ? "and mended where it contradicted itself" : "and solved");
 		say(`${S.givens(result.grid)} givens read ${note} ${outcome}.${checked}`,
 			read.solutions !== 1);
 	}
