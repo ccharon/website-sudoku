@@ -684,10 +684,27 @@ function initUI() {
 	// Entry point for camera.js, which fills the board from a photo.
 	globalThis.Sudoku.ui = {
 		setStatus: setStatus,
+		/**
+		 * Takes a reading as the givens and solves it right away when it is free
+		 * of conflicts and has exactly one solution. Returns the first conflict
+		 * in the wording the buttons use, else the number of solutions counted
+		 * to two, so the caller can say what became of the reading.
+		 */
 		setPuzzle: function (grid, uncertain) {
 			takeAsGiven(grid);
-			showGrid(grid, false);
+			const conflicts = validate(grid);
+			if (conflicts.length > 0) {
+				showGrid(grid, false);
+				markConflicts(conflicts);
+				if (uncertain) markUncertain(uncertain);
+				const more = conflicts.length > 1 ? ` (+${conflicts.length - 1} more)` : "";
+				return { solutions: 0, conflict: conflictText(conflicts[0]) + more };
+			}
+			const count = countSolutions(grid, 2);
+			const solution = count === 1 ? solve(grid, null) : null;
+			showGrid(solution === null ? grid : solution, solution !== null);
 			if (uncertain) markUncertain(uncertain);
+			return { solutions: count, conflict: null };
 		}
 	};
 

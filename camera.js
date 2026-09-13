@@ -1405,11 +1405,18 @@ function initPhoto() {
 			say("The board is not ready. Reload the page.", true);
 			return;
 		}
-		S.ui.setPuzzle(result.grid, result.uncertain);
+		const read = S.ui.setPuzzle(result.grid, result.uncertain);
+		if (read.conflict !== null) {
+			say(read.conflict, true);
+			return;
+		}
 		const open = result.uncertain.reduce(function (n, v) { return n + v; }, 0);
 		const checked = open === 0 ? "" :
 			` Check the ${open} marked cell${open === 1 ? "" : "s"}.`;
-		say(`${S.givens(result.grid)} givens read ${note}.${checked}`, false);
+		const outcome = read.solutions === 1 ? "and solved" :
+			read.solutions === 0 ? "but it has no solution" : "but it has several solutions";
+		say(`${S.givens(result.grid)} givens read ${note} ${outcome}.${checked}`,
+			read.solutions !== 1);
 	}
 
 	function tick() {
