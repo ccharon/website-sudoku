@@ -27,6 +27,7 @@ const INK_FIND = 0.88;      // threshold of the pass that looks for the outline
 const THIN_DROP = 0.12;     // the stricter pass, used for counters, sits this far below
 const THIN_KEEP = 0.6;      // ink the stricter pass must retain to be believed
 const INK_TRIES = [0.9, 0.96, 0.84];    // retried in this order until the reading solves
+const FIND_STEP = 10;      // grey levels the outline pass needs below the mean
 
 /** Returns the luma plane of an ImageData. */
 function toGray(image) {
@@ -62,9 +63,12 @@ function integral(gray, w, h) {
 
 /**
  * Marks every pixel darker than the mean of its neighbourhood. A global
- * threshold fails on photos because of shadows and uneven light.
+ * threshold fails on photos because of shadows and uneven light. The pixel
+ * must also lie step grey levels below the mean, so noise on a black table
+ * does not count as ink.
  */
-function threshold(gray, w, h, radius, bias) {
+function threshold(gray, w, h, radius, bias, step) {
+	const floor = step || 0;
 	const sum = integral(gray, w, h);
 	const mask = new Uint8Array(w * h);
 	const stride = w + 1;
@@ -77,7 +81,8 @@ function threshold(gray, w, h, radius, bias) {
 			const count = (x1 - x0 + 1) * (y1 - y0 + 1);
 			const area = sum[(y1 + 1) * stride + x1 + 1] - sum[y0 * stride + x1 + 1] -
 				sum[(y1 + 1) * stride + x0] + sum[y0 * stride + x0];
-			mask[y * w + x] = gray[y * w + x] * count < area * bias ? 1 : 0;
+			const g = gray[y * w + x];
+			mask[y * w + x] = g * count < area * bias && (g + floor) * count < area ? 1 : 0;
 		}
 	}
 	return mask;
@@ -409,18 +414,36 @@ function rectQuad(rect) {
 	return [[rect.x0, rect.y0], [rect.x1, rect.y0], [rect.x1, rect.y1], [rect.x0, rect.y1]];
 }
 
+/** Carries points of the straightened image back into the photo. */
+function toPhoto(quad, points, size) {
+	const m = unitToQuad(quad);
+	return points.map(function (p) {
+		const u = p[0] / size;
+		const v = p[1] / size;
+		const den = m.g * u + m.h * v + 1;
+		return [(m.a * u + m.b * v + m.c) / den, (m.d * u + m.e * v + m.f) / den];
+	});
+}
+
 /* ---------------------------------------------------------------- Grid lines */
 
 const LINE_GAP = 0.03;      // share of the image a line may be broken for, dotted rules included
 const LINE_COVER = 0.6;     // share of the way across a line has to reach to count
 const LINE_THICK = 0.04;    // a band wider than this share of the image is not one line
 const MIN_BANDS = 8;        // lines a direction must show before it is rated at all
+const BOX = 3;              // cells along one side of a box
 const CELLS_OFF = 2;        // how far the counted cells may differ from nine
 const DRIFT_COST = 4;       // weight of uneven spacing against the rating
 const OFF_SIZE = 0.6;       // what a grid that is not nine cells wide still scores
+const BOXES_ONLY = 0.75;    // and what one scores that shows only the lines around its boxes
 const BOUND_KEEP = 0.5;     // share of the image a cut has to leave standing
 const BOUND_EDGE = 0.02;    // a bound this close to the edge has cut nothing off
 const MIN_CUT_BANDS = 4;    // lines needed before the inner extent means anything
+const PAPER_RANK = 0.95;    // brightness rank taken as the colour of the paper
+const DARK_LEVEL = 0.5;     // darker than this share of the paper is not paper
+const FRAME_LINE = 0.12;    // share of a cell up to which a dark edge is the frame and stays
+const EDGE_SKIP = 0.1;      // share of each edge left out at the corners
+const EDGE_NEAR = 0.1;      // share of a cell a point may lie off the fitted edge
 
 /**
  * Index steps of one direction: from one band to the next, and from one pixel
@@ -518,19 +541,22 @@ function bandScore(ink, size) {
 	let score = 1;
 	for (const along of [true, false]) {
 		const bands = lineBands(ink, size, along);
-		if (bands.length < MIN_BANDS) return 0;
+		if (bands.length < BOX + 1) return 0;
 		const steps = [];
 		for (let i = 1; i < bands.length; i++) steps.push(bands[i] - bands[i - 1]);
 		const step = median(steps);
 		if (!(step > 0)) return 0;
 		const reach = bands[bands.length - 1] - bands[0];
 		const cells = Math.round(reach / step);
-		if (Math.abs(cells - S.SIZE) > CELLS_OFF) return 0;
+		// Faint cell lines drop out and leave only the lines around the boxes.
+		const boxesOnly = bands.length === BOX + 1 && cells === BOX;
+		if (!boxesOnly && bands.length < MIN_BANDS) return 0;
+		if (!boxesOnly && Math.abs(cells - S.SIZE) > CELLS_OFF) return 0;
 		let drift = 0;
 		for (const d of steps) drift += Math.abs(d - step);
 		drift /= steps.length * step;
 		score *= Math.max(0, 1 - DRIFT_COST * drift) * (reach / size) *
-			(cells === S.SIZE ? 1 : OFF_SIZE);
+			(cells === S.SIZE ? 1 : (boxesOnly ? BOXES_ONLY : OFF_SIZE));
 	}
 	return score;
 }
@@ -555,6 +581,88 @@ function gridBounds(ink, size) {
 	const trimmed = box.x0 > size * BOUND_EDGE || box.y0 > size * BOUND_EDGE ||
 		box.x1 < size * (1 - BOUND_EDGE) || box.y1 < size * (1 - BOUND_EDGE);
 	return trimmed ? box : null;
+}
+
+/** The brightness most of the straightened image stays below, taken as the paper. */
+function paperLevel(flat) {
+	const counts = new Uint32Array(256);
+	for (let i = 0; i < flat.length; i++) counts[flat[i]]++;
+	let level = 255;
+	for (let seen = 0; level > 0; level--) {
+		seen += counts[level];
+		if (seen >= flat.length * (1 - PAPER_RANK)) break;
+	}
+	return level;
+}
+
+/**
+ * How deep the dark surround reaches in from one edge, as a line depth = a + b * t
+ * across the edge. Grid lines that run into the surround reach deeper, so the
+ * line is fitted to the shallow half and whatever lies near it.
+ */
+function surroundEdge(flat, size, dark, along, from, dir) {
+	const at = along
+		? function (t, i) { return flat[t * size + from + dir * i]; }
+		: function (t, i) { return flat[(from + dir * i) * size + t]; };
+	const skip = Math.round(size * EDGE_SKIP);
+	const points = [];
+	for (let t = skip; t < size - skip; t++) {
+		let i = 0;
+		// The outermost pixels blend the surround with whatever lies past it.
+		while (i < size * BOUND_EDGE && at(t, i) >= dark) i++;
+		if (i >= size * BOUND_EDGE) i = 0;
+		else while (i < size && at(t, i) < dark) i++;
+		points.push([t, i]);
+	}
+	const depths = points.map(function (p) { return p[1]; });
+	if (median(depths) < size * FRAME_LINE / S.SIZE) return null;
+
+	const half = points.length >> 1;
+	const left = points.slice(0, half);
+	const right = points.slice(half);
+	const t0 = median(left.map(function (p) { return p[0]; }));
+	const t1 = median(right.map(function (p) { return p[0]; }));
+	const d0 = median(left.map(function (p) { return p[1]; }));
+	const d1 = median(right.map(function (p) { return p[1]; }));
+	const slope = (d1 - d0) / (t1 - t0);
+	const near = size * EDGE_NEAR / S.SIZE;
+	const kept = points.filter(function (p) { return Math.abs(p[1] - d0 - slope * (p[0] - t0)) < near; });
+	if (kept.length < points.length / 2) return null;
+
+	let st = 0, sd = 0, stt = 0, std = 0;
+	for (const p of kept) { st += p[0]; sd += p[1]; stt += p[0] * p[0]; std += p[0] * p[1]; }
+	const n = kept.length;
+	const b = (n * std - st * sd) / (n * stt - st * st);
+	return [(sd - b * st) / n, b];
+}
+
+/**
+ * Cuts off the dark surround that a light sheet on a black table leaves inside
+ * the outline, and a frame thick enough to shift the cells. Returns the four
+ * corners of what is left, in pixels of the straightened image, or null.
+ */
+function paperQuad(flat, size) {
+	const dark = paperLevel(flat) * DARK_LEVEL;
+	const top = surroundEdge(flat, size, dark, false, 0, 1);
+	const bottom = surroundEdge(flat, size, dark, false, size - 1, -1);
+	const left = surroundEdge(flat, size, dark, true, 0, 1);
+	const right = surroundEdge(flat, size, dark, true, size - 1, -1);
+	if (top === null && bottom === null && left === null && right === null) return null;
+
+	// Each edge as position = p + q * across, with the far edges counted from size.
+	function edge(line, far) {
+		if (line === null) return far ? [size, 0] : [0, 0];
+		return far ? [size - line[0], -line[1]] : line;
+	}
+	function corner(rows, cols) {
+		const x = (cols[0] + cols[1] * rows[0]) / (1 - cols[1] * rows[1]);
+		return [x, rows[0] + rows[1] * x];
+	}
+	const t = edge(top, false), b = edge(bottom, true);
+	const l = edge(left, false), r = edge(right, true);
+	const quad = [corner(t, l), corner(t, r), corner(b, r), corner(b, l)];
+	const sides = sideLengths(quad);
+	return Math.min(...sides) < size * BOUND_KEEP ? null : quad;
 }
 
 /* ------------------------------------------------------------ Grid detection */
@@ -1092,44 +1200,71 @@ function inkOf(plane, bias) {
 	return threshold(plane.flat, plane.size, plane.size, plane.radius, bias);
 }
 
-/** Finds the grid in a grey plane and straightens it, the costly half of a reading. */
-function straighten(gray, w, h, cellPx) {
-	if (templates === null) templates = buildTemplates();
-
-	const radius = Math.max(FIND_RADIUS, Math.round(Math.min(w, h) / FIND_CELLS));
-	const ink = threshold(gray, w, h, radius, INK_FIND);
-
-	const quad = findGrid(gray, ink, w, h);
-	if (quad === null) return null;
-
-	const cell = cellPx || WARP_STILL;
+/** A grey plane straightened along one quadrilateral of the photo. */
+function planeOf(gray, w, h, quad, cell) {
 	const size = cell * S.SIZE;
-	const plane = {
+	return {
 		flat: rectify(gray, w, h, quad, size),
 		size: size,
 		radius: Math.round(cell / 2),
 		scale: sideOf(quad) / size,
 		quad: quad
 	};
+}
 
-	/*
-	 * The cut is kept only if the lines come out more regular for it. A grid
-	 * that scored nothing gives any cut that edge, so such a cut must score
-	 * well on its own.
-	 */
+/** The corners of the grid in a grey plane, or null. */
+function locate(gray, w, h) {
+	const radius = Math.max(FIND_RADIUS, Math.round(Math.min(w, h) / FIND_CELLS));
+	return findGrid(gray, threshold(gray, w, h, radius, INK_FIND, FIND_STEP), w, h);
+}
+
+/**
+ * Cuts the plane down to the 9x9 grid when a title box shares the outline.
+ * The cut is kept only if the lines come out more regular for it. A grid that
+ * scored nothing gives any cut that edge, so such a cut must score well itself.
+ */
+function dropTitle(gray, w, h, plane, cell) {
 	const before = inkOf(plane, INK_BIAS);
-	const bounds = gridBounds(before, size);
-	if (bounds !== null) {
-		const cropped = rectify(plane.flat, size, size, rectQuad(bounds), size);
-		const after = threshold(cropped, size, size, plane.radius, INK_BIAS);
-		const was = bandScore(before, size);
-		const now = bandScore(after, size);
-		if (now > was + CUT_GAIN && (was > 0 || now > CUT_SURE)) {
-			plane.flat = cropped;
-			plane.scale *= (bounds.y1 - bounds.y0) / size;
-		}
-	}
-	return plane;
+	const bounds = gridBounds(before, plane.size);
+	if (bounds === null) return plane;
+	const cut = planeOf(gray, w, h, toPhoto(plane.quad, rectQuad(bounds), plane.size), cell);
+	const was = bandScore(before, plane.size);
+	const now = bandScore(inkOf(cut, INK_BIAS), cut.size);
+	return now > was + CUT_GAIN && (was > 0 || now > CUT_SURE) ? cut : plane;
+}
+
+/**
+ * The ways to straighten a plane whose outline took in a dark surround, best
+ * first. The line rating cannot choose among them, so the solver does. With
+ * the surround cut off, a grid it had merged with stands free and is looked
+ * for again, and the uncut plane stays as the last resort.
+ */
+function surroundCuts(gray, w, h, plane, cell) {
+	const paper = paperQuad(plane.flat, plane.size);
+	if (paper === null) return [plane];
+	const out = planeOf(gray, w, h, toPhoto(plane.quad, paper, plane.size), cell);
+	const inner = locate(out.flat, out.size, out.size);
+	if (inner === null) return [out, plane];
+	let free = planeOf(gray, w, h, toPhoto(out.quad, inner, out.size), cell);
+	const frame = paperQuad(free.flat, free.size);
+	if (frame !== null) free = planeOf(gray, w, h, toPhoto(free.quad, frame, free.size), cell);
+	return [out, free, plane];
+}
+
+/**
+ * Finds the grid in a grey plane and straightens it, the costly half of a
+ * reading. Returns the candidate planes, best first, or null.
+ */
+function straighten(gray, w, h, cellPx) {
+	if (templates === null) templates = buildTemplates();
+
+	const quad = locate(gray, w, h);
+	if (quad === null) return null;
+
+	const cell = cellPx || WARP_STILL;
+	return surroundCuts(gray, w, h, planeOf(gray, w, h, quad, cell), cell).map(function (plane) {
+		return dropTitle(gray, w, h, plane, cell);
+	});
 }
 
 /**
@@ -1161,9 +1296,9 @@ function readCells(plane, bias) {
 
 /** Runs the whole chain on one frame at the usual threshold, dark ink assumed. */
 function readImage(image, cellPx, bias) {
-	const plane = straighten(toGray(image), image.width, image.height, cellPx);
-	if (plane === null) return { ok: false, reason: "no grid found" };
-	return readCells(plane, bias || INK_BIAS);
+	const planes = straighten(toGray(image), image.width, image.height, cellPx);
+	if (planes === null) return { ok: false, reason: "no grid found" };
+	return readCells(planes[0], bias || INK_BIAS);
 }
 
 /* -------------------------------------------------------------------- Repair */
@@ -1309,10 +1444,16 @@ function readSolvable(plane) {
 /** Reads one frame at one polarity, dark ink on a light ground unless reversed. */
 function readFrame(image, cellPx, dark) {
 	const gray = toGray(image);
-	const plane = straighten(dark ? invertPlane(gray) : gray,
+	const planes = straighten(dark ? invertPlane(gray) : gray,
 		image.width, image.height, cellPx);
-	if (plane === null) return { ok: false, reason: "no grid found" };
-	return readSolvable(plane);
+	if (planes === null) return { ok: false, reason: "no grid found" };
+	let first = null;
+	for (const plane of planes) {
+		const result = readSolvable(plane);
+		if (result.ok) return result;
+		if (first === null) first = result;
+	}
+	return first;
 }
 
 /**
