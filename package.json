@@ -1,0 +1,10 @@
+{
+  "name": "website-sudoku",
+  "private": true,
+  "description": "Build tools for build.sh, pinned here so Dependabot keeps them current",
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "lightningcss-cli": "1.33.0",
+    "wasm-pack": "0.15.0"
+  }
+}

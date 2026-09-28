@@ -13,57 +13,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install minification tools
+      - name: Install build tools
         run: |
-          npm install -g --prefix "$RUNNER_TEMP/npm" terser lightningcss-cli
-          echo "$RUNNER_TEMP/npm/bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          # esbuild, lightningcss and wasm-pack, in the versions package-lock.json names.
+          npm ci
 
-      - name: Bundle and minify JS
-        run: |
-          # index.html holds the load order, so a further script needs no change here.
-          FILES=$(sed -n 's/.*<script src="\([^"]*\.js\)".*/\1/p' index.html | tr '\n' ' ')
-          test -n "$FILES" || { echo "index.html names no script"; exit 1; }
-          echo "bundling $FILES"
-          cat $FILES > bundle.src.js
-          # Nothing outside the bundle reads a top level name, so they may be shortened.
-          terser bundle.src.js -c passes=3 -m --toplevel -o bundle.js
-          rm bundle.src.js $FILES
-          awk '
-            /<script src="[^"]*\.js"[^>]*><\/script>/ {
-              if (!seen) { sub(/src="[^"]*\.js"/, "src=\"bundle.js\""); seen = 1; print }
-              next
-            }
-            { print }
-          ' index.html > index.tmp && mv index.tmp index.html
-
-      - name: Minify CSS
-        run: lightningcss --minify style.css -o style.css.tmp && mv style.css.tmp style.css
+      - name: Build
+        run: ./build.sh dist "$(git rev-parse --short HEAD)"
 
       - name: Push to dist branch
         run: |
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
           SHA=$(git rev-parse --short HEAD)
-          sed -i -E "s/(href|src)=\"(bundle\.js|style\.css)\"/\\1=\"\\2?v=$SHA\"/g" index.html
-          sed -i -E "s|(<span id=\"build\">)[^<]*(</span>)|\\1$SHA\\2|" index.html
-          # Twins for gzip_static and brotli_static, written once index.html is final.
-          ASSETS="index.html style.css bundle.js icons/favicon.svg"
-          node -e '
-            const fs = require("fs"), zlib = require("zlib");
-            for (const f of process.argv.slice(1)) {
-              const raw = fs.readFileSync(f);
-              fs.writeFileSync(f + ".gz", zlib.gzipSync(raw, { level: 9 }));
-              fs.writeFileSync(f + ".br", zlib.brotliCompressSync(raw, { params: {
-                [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
-                [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.length
-              } }));
-              console.log(f, raw.length, fs.statSync(f + ".gz").size, fs.statSync(f + ".br").size);
-            }
-          ' $ASSETS
           git checkout --orphan dist-new
-          git rm -rf . --cached
-          git add $ASSETS icons/favicon-32.png icons/apple-touch-icon.png
-          for f in $ASSETS; do git add "$f.gz" "$f.br"; done
+          git rm -rf . --cached -q
+          # The files of dist/ become the root of the branch.
+          git --work-tree=dist add --all
           git commit -m "dist: build from $SHA"
           git push origin HEAD:dist --force
 

@@ -1,0 +1,36 @@
+name: Check
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build tools
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown --component clippy
+          npm ci
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # The puzzle files live in the sudoku-solver repository, which CI cannot reach.
+        run: cargo test --workspace --release -- --skip every_puzzle_has_one_checked_solution --skip edge_cases
+
+      - name: Check scripts
+        run: |
+          node --check web/app.js
+          node --check web/camera.js
+
+      - name: Build
+        run: ./build.sh dist "$(git rev-parse --short HEAD)"

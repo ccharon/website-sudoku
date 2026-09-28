@@ -1,0 +1,10 @@
+[package]
+name = "sudoku-train"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+ab_glyph = "0.2"
+sudoku-ocr = { path = "../ocr" }
+sudoku-solver = { path = "../solver" }

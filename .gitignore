@@ -1,2 +1,6 @@
 .idea/
 CLAUDE.md
+target/
+web/pkg/
+dist/
+node_modules/
